@@ -1,0 +1,340 @@
+From 8f882c5a1e20a12b74443c9429aa1a2071388126 Mon Sep 17 00:00:00 2001
+From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
+Date: Sat, 15 Aug 2026 00:36:47 -0700
+Subject: [PATCH 1/3] feat(a11y): carry CXone pageID on review sections,
+ extract TOC build/merge
+
+Accessibility review sections are currently built inline inside
+importA11YSectionsFromTOC and keyed only by sectionTitle. Two consequences:
+
+- A section records no page identity, so anything downstream that wants to
+  address a CXone page has only its URL to go on.
+- Merging a re-imported TOC matches on title alone, so a retitled page loses
+  every answer already recorded against it.
+
+Extract the traversal and merge into server/util/a11yreviewutils.ts:
+
+- buildA11YReviewSectionsFromTOC walks children/subpages, skips malformed
+  entries, and records pageID from the TOC node's id/@id.
+- mergeA11YReviewSectionsFromTOC matches existing sections by URL first and
+  falls back to title, consuming each existing section at most once, and
+  refreshes title/URL/pageID while preserving recorded review state.
+
+Both are covered by unit tests, run with `npm test` in server/ via the node
+test runner.
+
+Also widens a11ySectionReviewSchema with the per-section scan fields
+(wcagReview, dojExceptions, remedyStatus, remedyLastScannedAt, remedyFindings,
+remedyWcagSummary, remedyError) and adds Project.remedyAdaptLastScan.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ server/models/project.ts            |   5 ++
+ server/package.json                 |   1 +
+ server/util/a11yreviewutils.test.ts | 130 ++++++++++++++++++++++++++++
+ server/util/a11yreviewutils.ts      | 106 ++++++++++++++++++++++-
+ 4 files changed, 241 insertions(+), 1 deletion(-)
+ create mode 100644 server/util/a11yreviewutils.test.ts
+
+diff --git a/server/models/project.ts b/server/models/project.ts
+index d3844075..6c5ff211 100644
+--- a/server/models/project.ts
++++ b/server/models/project.ts
+@@ -66,6 +66,7 @@ export interface ProjectInterfaceRaw {
+   currentProgress?: number;
+   peerProgress?: number;
+   a11yProgress?: number;
++  remedyAdaptLastScan?: any;
+   classification?:
+     | "harvesting"
+     | "curation"
+@@ -310,6 +311,10 @@ const ProjectSchema = new Schema<ProjectInterface>(
+      * Text section accessibility reviews.
+      */
+     a11yReview: [a11ySectionReviewSchema],
++    /**
++     * Latest ADAPT accessibility scan summary attached to this Project.
++     */
++    remedyAdaptLastScan: Schema.Types.Mixed,
+     /**
+      * The uuid of the Harvesting Request (SupportTicket) that generated this Project, if applicable.
+      * Note: on some very old Projects, this may be the legacy Harvest Request Mongo _id (before Harvesting Requests were converted to SupportTickets).
+diff --git a/server/package.json b/server/package.json
+index 712dee50..077c5929 100644
+--- a/server/package.json
++++ b/server/package.json
+@@ -6,6 +6,7 @@
+   "type": "module",
+   "scripts": {
+     "dev": "tsx watch --clear-screen=false server.ts",
++    "test": "tsx --test \"util/**/*.test.ts\"",
+     "build": "tsup server.ts --format esm --dts --out-dir dist && tsc-alias",
+     "start:prod": "node --experimental-specifier-resolution=node dist/server.js",
+     "export:support": "tsx scripts/exportSanitizedSupportTickets.ts"
+diff --git a/server/util/a11yreviewutils.test.ts b/server/util/a11yreviewutils.test.ts
+new file mode 100644
+index 00000000..5f21d486
+--- /dev/null
++++ b/server/util/a11yreviewutils.test.ts
+@@ -0,0 +1,130 @@
++/// <reference types="node" />
++import assert from "node:assert/strict";
++import test from "node:test";
++
++import {
++  buildA11YReviewSectionsFromTOC,
++  mergeA11YReviewSectionsFromTOC,
++} from "./a11yreviewutils";
++
++test("buildA11YReviewSectionsFromTOC flattens every descendant page in TOC order", () => {
++  const toc = {
++    id: "4307",
++    title: "Chemistry - The Central Science",
++    url: "https://dev.libretexts.org/Sandboxes/remedy-test/chemistry_central",
++    children: [
++      {
++        id: "4308",
++        title: "01: Introduction - Matter and Measurement",
++        url: "https://dev.libretexts.org/Sandboxes/remedy-test/chemistry_central/01%3A_Introduction",
++        children: [
++          {
++            id: 4313,
++            title: "1.01: Studying Chemistry",
++            url: "https://dev.libretexts.org/Sandboxes/remedy-test/chemistry_central/01%3A_Introduction/1.01%3A_Studying_Chemistry",
++          },
++          {
++            "@id": "4314",
++            title: "1.02: Classification of Matter",
++            url: "https://dev.libretexts.org/Sandboxes/remedy-test/chemistry_central/01%3A_Introduction/1.02%3A_Classification_of_Matter",
++          },
++        ],
++      },
++      {
++        id: "4309",
++        title: "02: Atoms, Molecules, and Ions",
++        url: "https://dev.libretexts.org/Sandboxes/remedy-test/chemistry_central/02%3A_Atoms",
++        children: [],
++      },
++    ],
++  };
++
++  const sections = buildA11YReviewSectionsFromTOC(toc);
++
++  assert.deepEqual(
++    sections.map((section) => section.sectionTitle),
++    [
++      "01: Introduction - Matter and Measurement",
++      "1.01: Studying Chemistry",
++      "1.02: Classification of Matter",
++      "02: Atoms, Molecules, and Ions",
++    ],
++  );
++  assert.deepEqual(
++    sections.map((section) => section.pageID),
++    ["4308", "4313", "4314", "4309"],
++  );
++});
++
++test("buildA11YReviewSectionsFromTOC skips malformed TOC entries without mutating the source", () => {
++  const child = {
++    id: "1",
++    title: "Valid",
++    url: "https://dev.libretexts.org/Sandboxes/remedy-test/valid",
++    children: [
++      { title: "", url: "https://dev.libretexts.org/Sandboxes/remedy-test/empty-title" },
++      { title: "Missing URL" },
++    ],
++  };
++  const toc = {
++    title: "Root",
++    url: "https://dev.libretexts.org/Sandboxes/remedy-test/root",
++    children: [child],
++  };
++
++  const sections = buildA11YReviewSectionsFromTOC(toc);
++
++  assert.equal(sections.length, 1);
++  assert.equal(sections[0].sectionTitle, "Valid");
++  assert.equal(child.children.length, 2);
++});
++
++test("mergeA11YReviewSectionsFromTOC preserves scan state while refreshing title, URL, and page ID", () => {
++  const existingSections = [
++    {
++      _id: "existing-one",
++      sectionTitle: "Old Chapter Title",
++      sectionURL: "https://dev.libretexts.org/Sandboxes/remedy-test/chemistry_central/01",
++      pageID: "old-page-id",
++      imgAltText: true,
++      wcagReview: { summary: { score: 88 } },
++      dojExceptions: [{ id: "exception-1", status: "verified" }],
++    },
++    {
++      _id: "existing-two",
++      sectionTitle: "1.01: Studying Chemistry",
++      sectionURL: "https://dev.libretexts.org/Sandboxes/remedy-test/old-studying-chemistry",
++      linkNoneEmpty: false,
++    },
++  ];
++  const tocSections = [
++    {
++      sectionTitle: "01: Introduction - Matter and Measurement",
++      sectionURL: "https://dev.libretexts.org/Sandboxes/remedy-test/chemistry_central/01",
++      pageID: "4308",
++    },
++    {
++      sectionTitle: "1.01: Studying Chemistry",
++      sectionURL: "https://dev.libretexts.org/Sandboxes/remedy-test/chemistry_central/01/1.01",
++      pageID: "4313",
++    },
++    {
++      sectionTitle: "1.02: Classification of Matter",
++      sectionURL: "https://dev.libretexts.org/Sandboxes/remedy-test/chemistry_central/01/1.02",
++      pageID: "4314",
++    },
++  ];
++
++  const merged = mergeA11YReviewSectionsFromTOC(tocSections, existingSections);
++
++  assert.equal(merged.length, 3);
++  assert.equal(merged[0]._id, "existing-one");
++  assert.equal(merged[0].sectionTitle, "01: Introduction - Matter and Measurement");
++  assert.equal(merged[0].pageID, "4308");
++  assert.deepEqual(merged[0].wcagReview, { summary: { score: 88 } });
++  assert.deepEqual(merged[0].dojExceptions, [{ id: "exception-1", status: "verified" }]);
++  assert.equal(merged[1]._id, "existing-two");
++  assert.equal(merged[1].sectionURL, "https://dev.libretexts.org/Sandboxes/remedy-test/chemistry_central/01/1.01");
++  assert.equal(merged[1].linkNoneEmpty, false);
++  assert.equal(merged[2]._id, undefined);
++});
+diff --git a/server/util/a11yreviewutils.ts b/server/util/a11yreviewutils.ts
+index 2570a6db..8858ebc9 100644
+--- a/server/util/a11yreviewutils.ts
++++ b/server/util/a11yreviewutils.ts
+@@ -2,9 +2,12 @@
+ // LibreTexts Conductor
+ // a11yutils.js
+ //
++import { Schema } from "mongoose";
++
+ export const a11ySectionReviewSchema = {
+     sectionTitle: String,
+     sectionURL: String,
++    pageID: String,
+     navKeyboard: Boolean,
+     imgAltText: Boolean,
+     imgDecorative: Boolean,
+@@ -38,7 +41,14 @@ export const a11ySectionReviewSchema = {
+     divSection: Boolean,
+     senseInstruction: Boolean,
+     timingCriteria: Boolean,
+-    codeAltText: Boolean
++    codeAltText: Boolean,
++    wcagReview: Schema.Types.Mixed,
++    dojExceptions: [Schema.Types.Mixed],
++    remedyStatus: String,
++    remedyLastScannedAt: Date,
++    remedyFindings: Array,
++    remedyWcagSummary: Object,
++    remedyError: String
+ };
+ 
+ 
+@@ -91,3 +101,97 @@ const a11ySectionReviewItems = [
+ export const validateA11YReviewSectionItem = (item: string) => {
+     return a11ySectionReviewItems.includes(item);
+ }
++
++type TocPage = {
++    id?: string | number;
++    '@id'?: string | number;
++    title?: string;
++    url?: string;
++    children?: TocPage[];
++    subpages?: TocPage[] | "";
++};
++
++export type A11YReviewSectionFromTOC = {
++    sectionTitle: string;
++    sectionURL: string;
++    pageID?: string;
++    [key: string]: unknown;
++};
++
++const getTocChildren = (page: TocPage | null | undefined): TocPage[] => {
++    if (!page || typeof page !== 'object') return [];
++    if (Array.isArray(page.children)) return page.children;
++    if (Array.isArray(page.subpages)) return page.subpages;
++    return [];
++};
++
++const pageToA11YSection = (page: TocPage): A11YReviewSectionFromTOC | null => {
++    if (!page || typeof page !== 'object') return null;
++    if (typeof page.title !== 'string' || page.title.trim().length === 0) return null;
++    if (typeof page.url !== 'string' || page.url.trim().length === 0) return null;
++    const rawID = page.id ?? page['@id'];
++    return {
++        sectionTitle: page.title,
++        sectionURL: page.url,
++        ...(rawID !== undefined && rawID !== null ? { pageID: String(rawID) } : {}),
++    };
++};
++
++export const buildA11YReviewSectionsFromTOC = (toc: TocPage | null | undefined): A11YReviewSectionFromTOC[] => {
++    const sections: A11YReviewSectionFromTOC[] = [];
++
++    const visit = (pages: TocPage[]) => {
++        pages.forEach((page) => {
++            const section = pageToA11YSection(page);
++            if (section) {
++                sections.push(section);
++            }
++            visit(getTocChildren(page));
++        });
++    };
++
++    visit(getTocChildren(toc));
++    return sections;
++};
++
++export const mergeA11YReviewSectionsFromTOC = (
++    tocSections: A11YReviewSectionFromTOC[],
++    existingSections: A11YReviewSectionFromTOC[] = [],
++): A11YReviewSectionFromTOC[] => {
++    const unmatchedExisting = new Set(existingSections.map((_section, index) => index));
++
++    const takeMatch = (matcher: (existing: A11YReviewSectionFromTOC) => boolean) => {
++        for (const index of unmatchedExisting) {
++            const existing = existingSections[index];
++            if (matcher(existing)) {
++                unmatchedExisting.delete(index);
++                return existing;
++            }
++        }
++        return null;
++    };
++
++    return tocSections.map((section) => {
++        const matchedByURL = takeMatch((existing) => (
++            typeof existing.sectionURL === 'string'
++            && existing.sectionURL.length > 0
++            && existing.sectionURL === section.sectionURL
++        ));
++        const matched = matchedByURL || takeMatch((existing) => (
++            typeof existing.sectionTitle === 'string'
++            && existing.sectionTitle.length > 0
++            && existing.sectionTitle === section.sectionTitle
++        ));
++
++        if (!matched) {
++            return section;
++        }
++
++        return {
++            ...matched,
++            sectionTitle: section.sectionTitle,
++            sectionURL: section.sectionURL,
++            ...(section.pageID ? { pageID: section.pageID } : {}),
++        };
++    });
++};

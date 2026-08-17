@@ -1,0 +1,2465 @@
+From 4bd9c2239c6467675c1a20497cca272d08f4f1b2 Mon Sep 17 00:00:00 2001
+From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
+Date: Sat, 15 Aug 2026 00:37:09 -0700
+Subject: [PATCH 3/3] feat(a11y): add WCAG matrix, scoring, and Remedy review
+ UI to Project Accessibility
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Extends the Project Accessibility tab from the checkbox matrix into a WCAG
+conformance view driven by scan results.
+
+- accessibilityScore.ts extracts the scoring out of the component:
+  computeA11yScore over the manual checkbox matrix, and
+  computeWcagProjectSummary which aggregates per-page WCAG summaries across
+  the project. The score denominator deliberately counts only pass/fail
+  criteria — manual-review and not-tested criteria are reported separately
+  rather than being folded in as failures, so an unreviewed project reads as
+  "not scored" (null) instead of 0%. Unit tests cover both.
+
+- types/a11y.ts describes the stored review shape: criterion status,
+  applicability, per-finding evidence, and DOJ exception records.
+
+- ProjectAccessibility.jsx gains the WCAG matrix, a Remedy health indicator,
+  per-section scan, and a fix workflow that previews an HTML diff before
+  anything is applied. Apply is only offered after a preview, and carries the
+  preview hash back so the server can reject a stale one.
+
+Tests run under vitest, matching the existing client suite.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../projects/ProjectAccessibility.jsx         | 1429 ++++++++++++++++-
+ client/src/components/projects/Projects.css   |  383 ++++-
+ .../projects/accessibilityScore.test.ts       |  162 ++
+ .../components/projects/accessibilityScore.ts |  155 ++
+ client/src/types/a11y.ts                      |   82 +
+ 5 files changed, 2177 insertions(+), 34 deletions(-)
+ create mode 100644 client/src/components/projects/accessibilityScore.test.ts
+ create mode 100644 client/src/components/projects/accessibilityScore.ts
+
+diff --git a/client/src/components/projects/ProjectAccessibility.jsx b/client/src/components/projects/ProjectAccessibility.jsx
+index 2429b27e..78be2275 100644
+--- a/client/src/components/projects/ProjectAccessibility.jsx
++++ b/client/src/components/projects/ProjectAccessibility.jsx
+@@ -18,7 +18,7 @@ import {
+   Checkbox
+ } from 'semantic-ui-react';
+ import { Link } from 'react-router-dom';
+-import React, { useEffect, useState } from 'react';
++import React, { useEffect, useRef, useState } from 'react';
+ import { useSelector } from 'react-redux';
+ import date from 'date-and-time';
+ import ordinal from 'date-and-time/plugin/ordinal';
+@@ -38,11 +38,485 @@ import {
+ } from '../util/ProjectHelpers';
+ 
+ import useGlobalError from '../error/ErrorHooks';
++import api from '../../api';
++import { computeA11yScore, computeWcagProjectSummary } from './accessibilityScore';
++
++const SUPPORTED_SCAN_KEYS = [
++    'imgAltText',
++    'imgDecorative',
++    'imgShortAlt',
++    'headingNoneEmpty',
++    'headingOutline',
++    'formFieldLabels',
++    'tableHeaders',
++    'tableLabel',
++    'listOlLabel',
++    'listUlLabel',
++    'linkNoneEmpty',
++    'linkSuspicious',
++    'linkExtLabeled',
++    'docLinkFile',
++];
++
++const FINDING_KIND_TO_CRITERIA = {
++    'img-alt-missing': ['imgAltText'],
++    'img-decorative-suspect': ['imgDecorative'],
++    'img-alt-too-long': ['imgShortAlt'],
++    'heading-empty': ['headingNoneEmpty'],
++    'heading-skipped-level': ['headingOutline'],
++    'form-label-missing': ['formFieldLabels'],
++    'table-header-missing': ['tableHeaders'],
++    'table-label-missing': ['tableLabel'],
++    'list-structure-invalid': ['listOlLabel', 'listUlLabel'],
++    'link-empty': ['linkNoneEmpty'],
++    'link-bare-url': ['linkSuspicious'],
++    'link-generic': ['linkSuspicious'],
++    'link-external-unlabeled': ['linkExtLabeled'],
++    'document-link-filetype-missing': ['docLinkFile'],
++};
++
++const WCAG_PRINCIPLES = ['Perceivable', 'Operable', 'Understandable', 'Robust'];
++
++const WCAG_STATUS_LABELS = {
++    pass: 'Pass',
++    fail: 'Fail',
++    not_applicable: 'N/A',
++    manual_review: 'Manual',
++    not_tested: 'Not tested',
++};
++
++const REMEDY_SCAN_DELAY_MS = 1100;
++
++const wait = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
++
++const getFixableFindings = (findings) => {
++    if (!Array.isArray(findings)) return [];
++    return findings.filter((finding) => finding.fixable);
++};
++
++const getFindingWcagIDs = (finding) => {
++    if (Array.isArray(finding?.wcagCriterionIds)) return finding.wcagCriterionIds;
++    if (Array.isArray(finding?.wcag_criterion_ids)) return finding.wcag_criterion_ids;
++    return [];
++};
++
++const getAffectedCriteriaKeys = (findings) => {
++    const keys = new Set();
++    if (!Array.isArray(findings)) return [];
++    findings.forEach((finding) => {
++        if (Array.isArray(finding.criteria_keys)) {
++            finding.criteria_keys.forEach((key) => keys.add(key));
++            return;
++        }
++        const mapped = FINDING_KIND_TO_CRITERIA[finding.kind] || [];
++        mapped.forEach((key) => keys.add(key));
++    });
++    return Array.from(keys);
++};
++
++const getSectionWcagReview = (section) => section?.wcagReview || section?.wcag_review || null;
++
++const getFixableWcagEvidence = (section) => {
++    const review = getSectionWcagReview(section);
++    if (!Array.isArray(review?.criteria)) return [];
++    const evidenceItems = [];
++    review.criteria.forEach((criterion) => {
++        if (!Array.isArray(criterion.evidence)) return;
++        criterion.evidence.forEach((evidence, evidenceIndex) => {
++            if (evidence?.fixable) {
++                evidenceItems.push({
++                    ...evidence,
++                    criterionId: criterion.id,
++                    criterionTitle: criterion.title,
++                    evidenceIndex,
++                });
++            }
++        });
++    });
++    return evidenceItems;
++};
++
++const getFixableWcagEvidenceCount = (section) => {
++    return getFixableWcagEvidence(section).length;
++};
++
++const getFixableFindingCount = (findings) => {
++    return getFixableFindings(findings).length;
++};
++
++const getSectionDojExceptions = (section) => {
++    if (Array.isArray(section?.dojExceptions)) return section.dojExceptions;
++    if (Array.isArray(section?.doj_exceptions)) return section.doj_exceptions;
++    return [];
++};
++
++const getWcagReviewFromResponse = (data) => data?.wcagReview || data?.wcag_review || null;
++
++const getDojExceptionsFromResponse = (data) => {
++    if (Array.isArray(data?.dojExceptions)) return data.dojExceptions;
++    if (Array.isArray(data?.doj_exceptions)) return data.doj_exceptions;
++    return [];
++};
++
++const hasRemedyScanTarget = (section) => {
++    if (!isEmptyString(section?.sectionURL)) return true;
++    if (typeof (section?.pageID) === 'number') return Number.isFinite(section.pageID) && section.pageID > 0;
++    if (typeof (section?.pageID) === 'string') return section.pageID.trim().length > 0;
++    return false;
++};
++
++const getSelectorAnchor = (selector) => {
++    if (typeof (selector) !== 'string') return '';
++    const directId = selector.match(/#([A-Za-z][\w:.-]*)/);
++    if (directId) return directId[1];
++    const quotedId = selector.match(/\[id=["']([^"']+)["']\]/);
++    return quotedId ? quotedId[1] : '';
++};
++
++const getEvidenceReviewURL = (section, evidence = {}) => {
++    if (isEmptyString(section?.sectionURL)) return '';
++    const anchor = getSelectorAnchor(evidence.selector);
++    if (isEmptyString(anchor)) return section.sectionURL;
++    try {
++        const url = new URL(section.sectionURL);
++        url.hash = anchor;
++        return url.toString();
++    } catch (_err) {
++        return `${section.sectionURL}#${encodeURIComponent(anchor)}`;
++    }
++};
++
++const getDiffStats = (diff = '') => {
++    const stats = { additions: 0, deletions: 0 };
++    diff.split('\n').forEach((line) => {
++        if (line.startsWith('+++') || line.startsWith('---')) return;
++        if (line.startsWith('+')) stats.additions += 1;
++        if (line.startsWith('-')) stats.deletions += 1;
++    });
++    return stats;
++};
++
++const getDiffLineClass = (line) => {
++    if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@') || line.startsWith('Index:') || line.startsWith('===')) {
++        return 'remedy-diff-meta';
++    }
++    if (line.startsWith('+')) return 'remedy-diff-add';
++    if (line.startsWith('-')) return 'remedy-diff-del';
++    return '';
++};
++
++const RuleList = ({ label, rules }) => (
++    <span>
++        <strong>{label}:</strong> {Array.isArray(rules) && rules.length > 0 ? rules.join(', ') : 'None reported'}
++    </span>
++);
++
++const WcagStatusLabel = ({ status }) => (
++    <span className={`wcag-status-pill wcag-status-${status}`}>
++        {WCAG_STATUS_LABELS[status] || status}
++    </span>
++);
++
++const WcagMetric = ({ label, value, help = '', className = '' }) => (
++    <div className={`wcag-page-metric ${className}`}>
++        <strong>{value}</strong>
++        <span>{label}</span>
++        {!isEmptyString(help) && <small>{help}</small>}
++    </div>
++);
++
++const EvidenceBookLink = ({ section, evidence, compact = false }) => {
++    const href = getEvidenceReviewURL(section, evidence);
++    if (isEmptyString(href)) return null;
++    return (
++        <Button
++            as='a'
++            basic
++            compact
++            size={compact ? 'mini' : 'small'}
++            href={href}
++            target='_blank'
++            rel='noopener noreferrer'
++        >
++            <Icon name='external' />
++            Open in book
++        </Button>
++    );
++};
++
++const WcagCriteriaDetails = ({ review, section }) => {
++    if (!review?.criteria?.length) {
++        return (
++            <p className='muted-text mb-0'>
++                No WCAG review has been stored for this page yet. Run Remedy to populate WCAG 2.1 A/AA status.
++            </p>
++        );
++    }
++
++    return (
++        <div className='wcag-criteria-details'>
++            {WCAG_PRINCIPLES.map((principle) => {
++                const criteria = review.criteria.filter((criterion) => criterion.principle === principle);
++                if (criteria.length === 0) return null;
++                return (
++                    <div key={principle} className='wcag-principle-group'>
++                        <Header as='h4'>{principle}</Header>
++                        <div className='wcag-criteria-grid'>
++                            {criteria.map((criterion) => (
++                                <div key={criterion.id} className={`wcag-criterion-card wcag-criterion-${criterion.status}`}>
++                                    <div className='wcag-criterion-title'>
++                                        <WcagStatusLabel status={criterion.status} />
++                                        <strong>{criterion.id}</strong>
++                                        <span>{criterion.title}</span>
++                                        <span className='wcag-level'>{criterion.level}</span>
++                                    </div>
++                                    <p>{criterion.applicabilityReason}</p>
++                                    {Array.isArray(criterion.evidence) && criterion.evidence.length > 0 && (
++                                        <details>
++                                            <summary>{criterion.evidence.length} evidence item(s)</summary>
++                                            <ul className='wcag-evidence-list'>
++                                                {criterion.evidence.slice(0, 5).map((evidence, evidenceIndex) => (
++                                                    <li key={`${criterion.id}-${evidence.findingId || evidence.ruleId}-${evidenceIndex}`} className='wcag-evidence-item'>
++                                                        <div className='wcag-evidence-message'>
++                                                            <strong>{evidence.ruleId}</strong>
++                                                            {evidence.fixable && <span className='muted-text'> fixable</span>}
++                                                            {!evidence.fixable && evidence.fixBlockedReason === 'broken-image-url' && (
++                                                                <span className='wcag-evidence-badge wcag-evidence-badge-warning'>broken image</span>
++                                                            )}
++                                                            <div>{evidence.message}</div>
++                                                            {evidence.fixBlockedMessage && (
++                                                                <div className='muted-text'>{evidence.fixBlockedMessage}</div>
++                                                            )}
++                                                        </div>
++                                                        <div className='wcag-evidence-actions'>
++                                                            {evidence.selector && <code>{evidence.selector}</code>}
++                                                            <EvidenceBookLink section={section} evidence={evidence} compact />
++                                                        </div>
++                                                        {evidence.snippet && (
++                                                            <details className='wcag-evidence-snippet'>
++                                                                <summary>HTML snippet</summary>
++                                                                <code>{evidence.snippet}</code>
++                                                            </details>
++                                                        )}
++                                                    </li>
++                                                ))}
++                                                {criterion.evidence.length > 5 && (
++                                                    <li className='muted-text'>Showing first 5 of {criterion.evidence.length}.</li>
++                                                )}
++                                            </ul>
++                                        </details>
++                                    )}
++                                </div>
++                            ))}
++                        </div>
++                    </div>
++                );
++            })}
++        </div>
++    );
++};
++
++const PreviewDiffPanel = ({ previewData, selectedCount, panelRef }) => {
++    if (!previewData) return null;
++    const diff = typeof (previewData.diff) === 'string' ? previewData.diff : '';
++    const lines = diff.split('\n');
++    const stats = getDiffStats(diff);
++    return (
++        <div ref={panelRef}>
++            <Segment className='mt-1p remedy-preview-segment'>
++                <Header as='h4'>Proposed changes</Header>
++                <Segment color='green' className='mt-1p'>
++                    Preview is ready. Review the proposed changes before applying them.
++                </Segment>
++                <div className='remedy-preview-summary'>
++                    <div className='remedy-preview-metric'>
++                        <strong>{previewData.page_wide ? 'Page' : selectedCount}</strong>
++                        <span>{previewData.page_wide ? 'preview scope' : 'selected issues'}</span>
++                    </div>
++                    <div className='remedy-preview-metric'>
++                        <strong>{Array.isArray(previewData.applied_rule_ids) ? previewData.applied_rule_ids.length : 0}</strong>
++                        <span>rules with changes</span>
++                    </div>
++                    <div className='remedy-preview-metric'>
++                        <strong>{stats.additions}</strong>
++                        <span>added lines</span>
++                    </div>
++                    <div className='remedy-preview-metric'>
++                        <strong>{stats.deletions}</strong>
++                        <span>removed lines</span>
++                    </div>
++                </div>
++                {previewData.noise_only_change && (
++                    <Segment color='yellow' className='mt-1p'>
++                        Remedy only found formatting changes, so applying is blocked until a real content change is available.
++                    </Segment>
++                )}
++                {Array.isArray(previewData.fix_errors) && previewData.fix_errors.length > 0 && (
++                    <Segment color='yellow' className='mt-1p'>
++                        <Header as='h5'>Fixes needing review</Header>
++                        <ul>
++                            {previewData.fix_errors.map((item, index) => (
++                                <li key={`${item.findingId || item.ruleId || 'fix'}-${index}`}>
++                                    <strong>{item.findingId || item.ruleId || 'Finding'}:</strong> {item.message}
++                                </li>
++                            ))}
++                        </ul>
++                    </Segment>
++                )}
++                <div className='remedy-rule-summary'>
++                    <RuleList label='Attempted rules' rules={previewData.attempted_rule_ids} />
++                    <RuleList label='Rules that changed HTML' rules={previewData.applied_rule_ids} />
++                </div>
++                <details className='remedy-diff-details'>
++                    <summary>Show HTML diff</summary>
++                    {diff.trim() ? (
++                        <pre className='remedy-diff'>
++                            {lines.map((line, index) => (
++                                <span key={`${index}-${line.slice(0, 20)}`} className={getDiffLineClass(line)}>
++                                    {line || ' '}
++                                    {'\n'}
++                                </span>
++                            ))}
++                        </pre>
++                    ) : (
++                        <p className='muted-text remedy-diff-empty'>No HTML changes were produced for this preview.</p>
++                    )}
++                </details>
++            </Segment>
++        </div>
++    );
++};
++
++const ApplyResultPanel = ({ applyResult }) => {
++    if (!applyResult) return null;
++    return (
++        <Segment color='green' className='mt-1p'>
++            <Header as='h4'>Apply complete</Header>
++            <p>Remedy wrote the selected changes and refreshed this page's WCAG review.</p>
++            {applyResult.revision_summary && <p><strong>Revision:</strong> {applyResult.revision_summary}</p>}
++            {applyResult.snapshot_path && <p><strong>Snapshot:</strong> {applyResult.snapshot_path}</p>}
++            <div className='remedy-rule-summary'>
++                <RuleList label='Attempted rules' rules={applyResult.attempted_rule_ids} />
++                <RuleList label='Applied rules' rules={applyResult.applied_rule_ids} />
++            </div>
++        </Segment>
++    );
++};
++
++const WcagReviewTable = ({
++    sections,
++    getSectionFixableIssueCount,
++    fixScanSectionID,
++    openFixModal,
++    openAddModal,
++}) => (
++    <div className='wcag-review-list'>
++        <Table celled className='mt-1p wcag-review-table'>
++            <Table.Header>
++                <Table.Row>
++                    <Table.HeaderCell>
++                        <Button
++                            color='green'
++                            icon
++                            onClick={openAddModal}
++                            id='access-add-section-btn'
++                        >
++                            <Icon name='add' />
++                        </Button>
++                    </Table.HeaderCell>
++                    <Table.HeaderCell textAlign='center'>Fails</Table.HeaderCell>
++                    <Table.HeaderCell textAlign='center'>Needs review</Table.HeaderCell>
++                    <Table.HeaderCell textAlign='center'>Not tested</Table.HeaderCell>
++                    <Table.HeaderCell textAlign='center'>Exceptions</Table.HeaderCell>
++                    <Table.HeaderCell textAlign='center'>Remedy</Table.HeaderCell>
++                </Table.Row>
++            </Table.Header>
++            <Table.Body>
++                {sections.length > 0 && sections.map((section) => {
++                    const review = getSectionWcagReview(section);
++                    const summary = review?.summary;
++                    const exceptions = getSectionDojExceptions(section);
++                    const fixableIssueCount = getSectionFixableIssueCount(section);
++                    const isLoadingFixFindings = fixScanSectionID === section._id;
++                    return (
++                        <React.Fragment key={section._id}>
++                            <Table.Row verticalAlign='middle' className='wcag-section-summary-row'>
++                                <Table.Cell>
++                                    <div className='wcag-page-title'>
++                                        {!isEmptyString(section.sectionURL) ? (
++                                            <a href={section.sectionURL} target='_blank' rel='noopener noreferrer'><strong>{section.sectionTitle}</strong></a>
++                                        ) : (
++                                            <strong>{section.sectionTitle}</strong>
++                                        )}
++                                    </div>
++                                    <div className='muted-text'>
++                                        {review?.scannedAt ? `Scanned ${review.scannedAt}` : 'Not scanned with Remedy yet'}
++                                    </div>
++                                </Table.Cell>
++                                <Table.Cell textAlign='center'>
++                                    <WcagMetric label='failed criteria' value={summary?.failCount ?? 0} className={(summary?.failCount ?? 0) > 0 ? 'metric-error' : ''} />
++                                </Table.Cell>
++                                <Table.Cell textAlign='center'>
++                                    <WcagMetric label='manual checks' value={summary?.manualReviewCount ?? 0} className={(summary?.manualReviewCount ?? 0) > 0 ? 'metric-warning' : ''} />
++                                </Table.Cell>
++                                <Table.Cell textAlign='center'>
++                                    <WcagMetric label='criteria' value={summary?.notTestedCount ?? 0} />
++                                </Table.Cell>
++                                <Table.Cell textAlign='center'>
++                                    <WcagMetric label='verified' value={summary?.verifiedExceptionCount ?? exceptions.filter((item) => item.status === 'verified').length} />
++                                </Table.Cell>
++                                <Table.Cell textAlign='center'>
++                                    {fixableIssueCount > 0 ? (
++                                        <Button
++                                            compact
++                                            color='red'
++                                            icon='wrench'
++                                            content={`Fix ${fixableIssueCount}`}
++                                            loading={isLoadingFixFindings}
++                                            disabled={Boolean(fixScanSectionID)}
++                                            onClick={() => openFixModal(section)}
++                                        />
++                                    ) : (
++                                        <span className='muted-text'>No fixable findings</span>
++                                    )}
++                                </Table.Cell>
++                            </Table.Row>
++                            <Table.Row className='wcag-section-details-row'>
++                                <Table.Cell colSpan={6} className='wcag-details-cell'>
++                                    <details className='wcag-section-details'>
++                                        <summary>
++                                            <span className='wcag-section-details-title'>
++                                                WCAG criteria for <strong>{section.sectionTitle}</strong>
++                                            </span>
++                                            {summary && (
++                                                <span className='muted-text'>
++                                                    {` · ${summary.passCount} passed · ${summary.notApplicableCount} not applicable`}
++                                                </span>
++                                            )}
++                                        </summary>
++                                        <WcagCriteriaDetails review={review} section={section} />
++                                    </details>
++                                </Table.Cell>
++                            </Table.Row>
++                        </React.Fragment>
++                    );
++                })}
++                {sections.length === 0 && (
++                    <Table.Row>
++                        <Table.Cell colSpan={6}>
++                            <span><em>No sections added yet.</em></span>
++                        </Table.Cell>
++                    </Table.Row>
++                )}
++            </Table.Body>
++        </Table>
++    </div>
++);
+ 
+ const ProjectAccessibility = (props) => {
+ 
+     // Global State and Eror Handling
+-    const { handleGlobalError } = useGlobalError();
++    const { handleGlobalError, clearError } = useGlobalError();
+     const user = useSelector((state) => state.user);
+ 
+     // UI
+@@ -53,8 +527,6 @@ const ProjectAccessibility = (props) => {
+     const [project, setProject] = useState({});
+     const [reviewSections, setReviewSections] = useState([]);
+ 
+-    const [accessScore, setAccessScore] = useState(90);
+-
+     // Project Permissions
+     const [canViewDetails, setCanViewDetails] = useState(false);
+ 
+@@ -67,6 +539,41 @@ const ProjectAccessibility = (props) => {
+     const [showSyncTOCModal, setShowSyncTOCModal] = useState(false);
+     const [syncTOCLoading, setSyncTOCLoading] = useState(false);
+ 
++    // Remedy scan + fix session state
++    const [showScanModal, setShowScanModal] = useState(false);
++    const [scanLoading, setScanLoading] = useState(false);
++    const [scanProgress, setScanProgress] = useState({ total: 0, completed: 0, currentTitle: '' });
++    const [scanFailures, setScanFailures] = useState([]);
++    const [remedyFindingsBySection, setRemedyFindingsBySection] = useState({});
++    const [showFixModal, setShowFixModal] = useState(false);
++    const [activeFixSection, setActiveFixSection] = useState(null);
++    const [selectedFindingIDs, setSelectedFindingIDs] = useState([]);
++    const [remedyFixMode, setRemedyFixMode] = useState('deterministic');
++    const [pipelineTier, setPipelineTier] = useState(1);
++    const [fixScanSectionID, setFixScanSectionID] = useState('');
++    const [fixModalMessage, setFixModalMessage] = useState('');
++    const [fixActionsBlocked, setFixActionsBlocked] = useState(false);
++    const [previewLoading, setPreviewLoading] = useState(false);
++    const [previewData, setPreviewData] = useState(null);
++    const previewPanelRef = useRef(null);
++    const [applyLoading, setApplyLoading] = useState(false);
++    const [applyResult, setApplyResult] = useState(null);
++    const reviewSectionsRef = React.useRef([]);
++    const legacyCriteriaUpdatesRef = React.useRef({});
++    const lastPersistedA11yProgressRef = React.useRef(0);
++    const persistA11yProgressTimeoutRef = React.useRef(null);
++    const isLocalDemoProject = import.meta.env.MODE === 'development' && props.match.params.id === 'chemcent01';
++
++    useEffect(() => {
++        if (!showFixModal || !previewData || !previewPanelRef.current) return;
++        window.requestAnimationFrame(() => {
++            previewPanelRef.current?.scrollIntoView({
++                block: 'start',
++                behavior: 'smooth',
++            });
++        });
++    }, [previewData, showFixModal]);
++
+     /**
+      * Set page title and load Project information on initial load.
+      */
+@@ -74,6 +581,9 @@ const ProjectAccessibility = (props) => {
+         document.title = "LibreTexts Conductor | Projects | Project View | Accessibility";
+         date.plugin(ordinal);
+         date.plugin(day_of_week);
++        if (isLocalDemoProject) {
++            clearError();
++        }
+         getProject();
+         if (localStorage.getItem('conductor_show_a11ydiscussion') !== null) {
+             if (localStorage.getItem('conductor_show_a11ydiscussion') === 'true') {
+@@ -100,12 +610,28 @@ const ProjectAccessibility = (props) => {
+         }
+     }, [project]);
+ 
++    useEffect(() => {
++        reviewSectionsRef.current = reviewSections;
++    }, [reviewSections]);
++
++    useEffect(() => {
++        return () => {
++            if (persistA11yProgressTimeoutRef.current !== null) {
++                window.clearTimeout(persistA11yProgressTimeoutRef.current);
++            }
++        };
++    }, []);
++
+ 
+     /*
+      * Update state with user's permissions within the project when
+      * their identity and the project data is available.
+      */
+     useEffect(() => {
++        if (isLocalDemoProject && Object.keys(project).length > 0) {
++            setCanViewDetails(true);
++            return;
++        }
+         if (typeof(user.uuid) === 'string' && user.uuid !== '' && Object.keys(project).length > 0) {
+             let adminPermissions = checkProjectAdminPermission(project, user);
+             if (adminPermissions) {
+@@ -116,7 +642,7 @@ const ProjectAccessibility = (props) => {
+                 setCanViewDetails(checkCanViewProjectDetails(project, user));
+             }
+         }
+-    }, [project, user, setCanViewDetails]);
++    }, [project, user, setCanViewDetails, isLocalDemoProject]);
+ 
+ 
+     /*
+@@ -142,7 +668,16 @@ const ProjectAccessibility = (props) => {
+         }).then((res) => {
+             if (!res.data.err) {
+                 if (res.data.project) {
+-                    setProject(res.data.project);
++                    const projectData = res.data.project;
++                    setProject(projectData);
++                    if (isLocalDemoProject && Array.isArray(projectData.a11yReview)) {
++                        setReviewSections(projectData.a11yReview);
++                        reviewSectionsRef.current = projectData.a11yReview;
++                        setCanViewDetails(true);
++                    }
++                    lastPersistedA11yProgressRef.current = typeof (projectData.a11yProgress) === 'number'
++                        ? projectData.a11yProgress
++                        : 0;
+                 }
+             } else {
+                 handleGlobalError(res.data.errMsg);
+@@ -155,7 +690,8 @@ const ProjectAccessibility = (props) => {
+     };
+ 
+ 
+-    const getReviewSections = () => {
++    const getReviewSections = (options = {}) => {
++        const { persistScore = false } = options;
+         setLoadingData(true);
+         axios.get('/project/accessibility/sections', {
+             params: {
+@@ -165,6 +701,10 @@ const ProjectAccessibility = (props) => {
+             if (!res.data.err) {
+                 if (res.data.a11yReview) {
+                     setReviewSections(res.data.a11yReview);
++                    reviewSectionsRef.current = res.data.a11yReview;
++                    if (persistScore) {
++                        schedulePersistA11yProgress(res.data.a11yReview);
++                    }
+                 }
+             } else {
+                 handleGlobalError(res.data.errMsg);
+@@ -201,30 +741,608 @@ const ProjectAccessibility = (props) => {
+         }
+     };
+ 
++    const persistA11yProgress = async (projectID, percent) => {
++        if (lastPersistedA11yProgressRef.current === percent) {
++            return;
++        }
++        try {
++            const res = await api.updateProject({
++                projectID,
++                a11yProgress: percent,
++            });
++            if (!res.data.err) {
++                lastPersistedA11yProgressRef.current = percent;
++                setProject((prevProject) => ({
++                    ...prevProject,
++                    a11yProgress: percent,
++                }));
++            }
++        } catch (_err) {
++            // Keep score persistence best-effort so it doesn't interrupt the main workflow.
++        }
++    };
+ 
+-    const updateSectionItem = (sectionID, itemName, newValue) => {
+-        axios.put('/project/accessibility/section/item', {
+-            projectID: props.match.params.id,
+-            sectionID: sectionID,
+-            itemName: itemName,
+-            newResponse: newValue
+-        }).then((res) => {
++    const schedulePersistA11yProgress = (sections) => {
++        if (!props.match?.params?.id) {
++            return;
++        }
++        if (persistA11yProgressTimeoutRef.current !== null) {
++            window.clearTimeout(persistA11yProgressTimeoutRef.current);
++        }
++        const wcagSummary = computeWcagProjectSummary(sections);
++        const legacySummary = computeA11yScore(sections);
++        const nextPercent = wcagSummary.reviewedPageCount > 0 && wcagSummary.score !== null
++            ? wcagSummary.score
++            : (legacySummary.populatedCount > 0 ? legacySummary.percent : 0);
++        persistA11yProgressTimeoutRef.current = window.setTimeout(() => {
++            persistA11yProgress(props.match.params.id, nextPercent);
++        }, 300);
++    };
++
++    const mergeSectionWcagState = (sectionID, wcagReview, dojExceptions) => {
++        if (!wcagReview && !Array.isArray(dojExceptions)) {
++            return;
++        }
++        const nextSections = reviewSectionsRef.current.map((item) => {
++            if (item._id === sectionID) {
++                return {
++                    ...item,
++                    ...(wcagReview ? { wcagReview } : {}),
++                    ...(Array.isArray(dojExceptions) ? { dojExceptions } : {}),
++                };
++            }
++            return item;
++        });
++        setReviewSections(nextSections);
++        reviewSectionsRef.current = nextSections;
++    };
++
++    const getRequestErrorMessage = (err, fallback = 'Network error.') => {
++        const status = err?.response?.status || err?.response?.data?.status;
++        if (status === 429) {
++            return 'Conductor API rate limit reached. Wait about a minute, then resume the failed pages.';
++        }
++        if (typeof (err?.response?.data?.errMsg) === 'string') {
++            return err.response.data.errMsg;
++        }
++        if (typeof (err?.response?.data) === 'string' && err.response.data.length > 0) {
++            return err.response.data;
++        }
++        if (typeof (err?.message) === 'string' && err.message.length > 0) {
++            return err.message;
++        }
++        return fallback;
++    };
++
++    const queueLegacyCriteriaUpdates = (sectionID, updates) => {
++        if (!sectionID || Object.keys(updates).length === 0) {
++            return;
++        }
++        legacyCriteriaUpdatesRef.current = {
++            ...legacyCriteriaUpdatesRef.current,
++            [sectionID]: {
++                ...(legacyCriteriaUpdatesRef.current[sectionID] || {}),
++                ...updates,
++            },
++        };
++    };
++
++    const mergeSectionLegacyCriteria = (sectionID, criteria, keys, options = {}) => {
++        const { onlyWhenMissing = true } = options;
++        if (!criteria || typeof criteria !== 'object') {
++            return false;
++        }
++        const keysToMerge = Array.isArray(keys) && keys.length > 0 ? keys : SUPPORTED_SCAN_KEYS;
++        let merged = false;
++        let queuedUpdates = {};
++        const nextSections = reviewSectionsRef.current.map((item) => {
++            if (item._id !== sectionID) {
++                return item;
++            }
++            const updates = {};
++            keysToMerge.forEach((key) => {
++                if (!SUPPORTED_SCAN_KEYS.includes(key)) {
++                    return;
++                }
++                if (typeof (criteria[key]) !== 'boolean') {
++                    return;
++                }
++                if (onlyWhenMissing && item[key] !== undefined) {
++                    return;
++                }
++                if (item[key] === criteria[key]) {
++                    return;
++                }
++                updates[key] = criteria[key];
++            });
++            if (Object.keys(updates).length === 0) {
++                return item;
++            }
++            merged = true;
++            queuedUpdates = updates;
++            return {
++                ...item,
++                ...updates,
++            };
++        });
++        if (merged) {
++            setReviewSections(nextSections);
++            reviewSectionsRef.current = nextSections;
++            queueLegacyCriteriaUpdates(sectionID, queuedUpdates);
++        }
++        return merged;
++    };
++
++    const persistLegacyCriteriaUpdates = async (options = {}) => {
++        const { suppressError = false } = options;
++        const updates = Object.entries(legacyCriteriaUpdatesRef.current)
++            .map(([sectionID, items]) => ({
++                sectionID,
++                items,
++            }))
++            .filter((update) => Object.keys(update.items).length > 0);
++        if (updates.length === 0) {
++            return { ok: true };
++        }
++        try {
++            const res = await axios.put('/project/accessibility/sections/items', {
++                projectID: props.match.params.id,
++                updates,
++            });
++            if (res.data.err) {
++                throw (new Error(res.data.errMsg || 'Could not save accessibility matrix updates.'));
++            }
++            legacyCriteriaUpdatesRef.current = {};
++            return { ok: true };
++        } catch (err) {
++            const message = getRequestErrorMessage(err, 'Could not save accessibility matrix updates.');
++            if (!suppressError) {
++                handleGlobalError(message);
++            }
++            return {
++                ok: false,
++                message,
++            };
++        }
++    };
++
++
++    const updateSectionItem = async (sectionID, itemName, newValue, options = {}) => {
++        const { suppressError = false, persistScore = true } = options;
++        try {
++            const res = await axios.put('/project/accessibility/section/item', {
++                projectID: props.match.params.id,
++                sectionID: sectionID,
++                itemName: itemName,
++                newResponse: newValue
++            });
+             if (!res.data.err) {
+-                let updatedSections = reviewSections.map((item) => {
++                const nextSections = reviewSectionsRef.current.map((item) => {
+                     if (item._id === sectionID) {
+-                        item[itemName] = newValue;
+-                        return item;
+-                    } else {
+-                        return item;
++                        return {
++                            ...item,
++                            [itemName]: newValue,
++                        };
+                     }
++                    return item;
+                 });
+-                setReviewSections(updatedSections);
+-            } else {
++                setReviewSections(nextSections);
++                reviewSectionsRef.current = nextSections;
++                if (persistScore) {
++                    schedulePersistA11yProgress(nextSections);
++                }
++                return true;
++            }
++            if (!suppressError) {
+                 handleGlobalError(res.data.errMsg);
+             }
+-        }).catch((err) => {
+-            handleGlobalError(err);
++        } catch (err) {
++            if (!suppressError) {
++                handleGlobalError(err);
++            }
++        }
++        return false;
++    };
++
++    const getCurrentReviewSection = (section) => {
++        return reviewSectionsRef.current.find((item) => item._id === section._id) || section;
++    };
++
++    const getSectionFixableFindings = (sectionID) => {
++        return getFixableFindings(remedyFindingsBySection[sectionID]);
++    };
++
++    const getSectionFixableIssueCount = (section) => {
++        const currentSection = getCurrentReviewSection(section);
++        const scannerFixableCount = getFixableFindingCount(remedyFindingsBySection[currentSection._id]);
++        const wcagFixableCount = getFixableWcagEvidenceCount(currentSection);
++        return Math.max(scannerFixableCount, wcagFixableCount);
++    };
++
++    const openScanModal = () => {
++        setScanProgress({
++            total: reviewSections.filter(hasRemedyScanTarget).length,
++            completed: 0,
++            currentTitle: '',
++        });
++        setScanFailures([]);
++        setShowScanModal(true);
++    };
++
++    const closeScanModal = () => {
++        if (!scanLoading) {
++            setScanFailures([]);
++            setShowScanModal(false);
++        }
++    };
++
++    const runSectionScan = async (section, findingsAccumulator, failuresAccumulator, attempt = 0) => {
++        setScanProgress((prev) => ({
++            ...prev,
++            currentTitle: section.sectionTitle || '',
++        }));
++        try {
++            const res = await axios.post('/project/accessibility/remedy/scan', {
++                projectID: props.match.params.id,
++                sectionID: section._id,
++                sectionURL: section.sectionURL,
++                pageID: section.pageID,
++                sectionTitle: section.sectionTitle,
++            });
++            if (res.data.err) {
++                if (res.data.status === 429 && attempt < 2) {
++                    await wait(65000);
++                    return runSectionScan(section, findingsAccumulator, failuresAccumulator, attempt + 1);
++                }
++                failuresAccumulator.push({
++                    sectionID: section._id,
++                    sectionTitle: section.sectionTitle,
++                    message: res.data.errMsg || 'Scan failed.',
++                });
++                return false;
++            }
++            const criteria = res.data.criteria || {};
++            const evaluatedKeys = Array.isArray(res.data.evaluated_keys) ? res.data.evaluated_keys : SUPPORTED_SCAN_KEYS;
++            findingsAccumulator[section._id] = Array.isArray(res.data.findings) ? res.data.findings : [];
++            mergeSectionWcagState(
++                section._id,
++                getWcagReviewFromResponse(res.data),
++                getDojExceptionsFromResponse(res.data),
++            );
++            mergeSectionLegacyCriteria(section._id, criteria, evaluatedKeys);
++            return true;
++        } catch (err) {
++            const status = err?.response?.status || err?.response?.data?.status;
++            if (status === 429 && attempt < 2) {
++                await wait(65000);
++                return runSectionScan(section, findingsAccumulator, failuresAccumulator, attempt + 1);
++            }
++            failuresAccumulator.push({
++                sectionID: section._id,
++                sectionTitle: section.sectionTitle,
++                message: getRequestErrorMessage(err),
++            });
++        }
++        return false;
++    };
++
++    const scanWithRemedy = async () => {
++        const allSections = reviewSections.filter(hasRemedyScanTarget);
++        const failedSectionIDs = new Set(scanFailures
++            .map((failure) => failure.sectionID)
++            .filter((sectionID) => typeof (sectionID) === 'string' && sectionID.length > 0));
++        const retrySections = failedSectionIDs.size > 0
++            ? allSections.filter((section) => failedSectionIDs.has(section._id))
++            : [];
++        const sections = retrySections.length > 0 ? retrySections : allSections;
++        const findingsAccumulator = {};
++        const failuresAccumulator = [];
++        let nextIndex = 0;
++        let completed = 0;
++        const concurrency = Math.min(1, sections.length);
++
++        if (allSections.length === 0) {
++            setShowScanModal(false);
++            return;
++        }
++        if (sections.length === 0) {
++            setScanFailures([]);
++            setShowScanModal(false);
++            return;
++        }
++
++        setScanLoading(true);
++        setScanProgress({
++            total: sections.length,
++            completed: 0,
++            currentTitle: '',
++        });
++        setScanFailures([]);
++
++        try {
++            await ensureRemedyServerReady();
++        } catch (err) {
++            setScanFailures([{
++                sectionTitle: 'Remedy Server',
++                message: err?.message || 'Remedy Server is not ready.',
++            }]);
++            setScanLoading(false);
++            return;
++        }
++
++        const worker = async () => {
++            while (nextIndex < sections.length) {
++                const currentIndex = nextIndex;
++                nextIndex += 1;
++                const section = sections[currentIndex];
++                await runSectionScan(section, findingsAccumulator, failuresAccumulator);
++                completed += 1;
++                setScanProgress((prev) => ({
++                    ...prev,
++                    completed,
++                }));
++                if (nextIndex < sections.length) {
++                    await wait(REMEDY_SCAN_DELAY_MS);
++                }
++            }
++        };
++
++        await Promise.all(Array.from({ length: concurrency }, () => worker()));
++        setRemedyFindingsBySection((prev) => ({
++            ...prev,
++            ...findingsAccumulator,
++        }));
++        const persistLegacyResult = await persistLegacyCriteriaUpdates({ suppressError: true });
++        if (!persistLegacyResult.ok) {
++            failuresAccumulator.push({
++                sectionTitle: 'Accessibility matrix',
++                message: persistLegacyResult.message,
++            });
++        }
++        schedulePersistA11yProgress(reviewSectionsRef.current);
++        setScanFailures(failuresAccumulator);
++        setScanProgress((prev) => ({
++            ...prev,
++            currentTitle: '',
++        }));
++        if (failuresAccumulator.length === 0) {
++            setShowScanModal(false);
++        }
++        setScanLoading(false);
++    };
++
++    const closeFixModal = () => {
++        if (!previewLoading && !applyLoading) {
++            setShowFixModal(false);
++            setActiveFixSection(null);
++            setSelectedFindingIDs([]);
++            setFixModalMessage('');
++            setFixActionsBlocked(false);
++            setPreviewData(null);
++            setApplyResult(null);
++        }
++    };
++
++    const ensureRemedyServerReady = async () => {
++        const res = await axios.get('/project/accessibility/remedy/health');
++        if (res.data.err) {
++            throw (new Error(res.data.errMsg || 'Remedy Server is not ready.'));
++        }
++    };
++
++    const refreshFixableFindingsForSection = async (section) => {
++        const currentSection = getCurrentReviewSection(section);
++        const cachedFixableFindings = getSectionFixableFindings(currentSection._id);
++        const wcagFixableCount = getFixableWcagEvidence(currentSection).length;
++        if (wcagFixableCount === 0 || cachedFixableFindings.length >= wcagFixableCount) {
++            return {
++                section: currentSection,
++                findings: cachedFixableFindings,
++                message: '',
++                blocked: false,
++            };
++        }
++
++        setFixScanSectionID(currentSection._id);
++        try {
++            await ensureRemedyServerReady();
++            const findingsAccumulator = {};
++            const failuresAccumulator = [];
++            const scanned = await runSectionScan(currentSection, findingsAccumulator, failuresAccumulator);
++            setRemedyFindingsBySection((prev) => ({
++                ...prev,
++                ...findingsAccumulator,
++            }));
++            if (scanned) {
++                await persistLegacyCriteriaUpdates({ suppressError: true });
++                schedulePersistA11yProgress(reviewSectionsRef.current);
++            }
++            const refreshedSection = getCurrentReviewSection(currentSection);
++            const freshFixableFindings = getFixableFindings(findingsAccumulator[currentSection._id]);
++            const refreshedWcagFixableCount = getFixableWcagEvidence(refreshedSection).length;
++            if (!scanned) {
++                return {
++                    section: refreshedSection,
++                    findings: [],
++                    message: failuresAccumulator[0]?.message || 'Remedy could not rescan this page for current fixable findings.',
++                    blocked: true,
++                };
++            }
++            if (freshFixableFindings.length === 0) {
++                return {
++                    section: refreshedSection,
++                    findings: [],
++                    message: refreshedWcagFixableCount > 0
++                        ? 'Fixable WCAG evidence exists, but no current Remedy fix is available after rescan.'
++                        : 'No current Remedy fixable findings remain after rescan.',
++                    blocked: false,
++                };
++            }
++            if (freshFixableFindings.length < refreshedWcagFixableCount) {
++                return {
++                    section: refreshedSection,
++                    findings: freshFixableFindings,
++                    message: `Fixable WCAG evidence exists for ${refreshedWcagFixableCount} item(s), but only ${freshFixableFindings.length} current Remedy fix(es) are available after rescan.`,
++                    blocked: false,
++                };
++            }
++            return {
++                section: refreshedSection,
++                findings: freshFixableFindings,
++                message: '',
++                blocked: false,
++            };
++        } catch (err) {
++            return {
++                section: getCurrentReviewSection(currentSection),
++                findings: [],
++                message: err?.response?.data?.errMsg || err?.message || 'Remedy could not rescan this page for current fixable findings.',
++                blocked: true,
++            };
++        } finally {
++            setFixScanSectionID('');
++        }
++    };
++
++    const openFixModal = async (section) => {
++        const {
++            section: refreshedSection,
++            findings: fixableFindings,
++            message,
++            blocked,
++        } = await refreshFixableFindingsForSection(section);
++        setActiveFixSection(refreshedSection);
++        setSelectedFindingIDs(fixableFindings.map((finding) => finding.id));
++        setRemedyFixMode('deterministic');
++        setPipelineTier(1);
++        setFixModalMessage(message);
++        setFixActionsBlocked(Boolean(blocked));
++        setPreviewData(null);
++        setApplyResult(null);
++        setShowFixModal(true);
++    };
++
++    const changeRemedyFixMode = (mode) => {
++        setRemedyFixMode(mode);
++        if (mode === 'pipeline' && selectedFindingIDs.length === 0 && activeFixSection) {
++            setSelectedFindingIDs(getSectionFixableFindings(activeFixSection._id).map((finding) => finding.id));
++        }
++        setPreviewData(null);
++        setApplyResult(null);
++    };
++
++    const changePipelineTier = (tier) => {
++        setPipelineTier(Number(tier));
++        setPreviewData(null);
++        setApplyResult(null);
++    };
++
++    const toggleSelectedFinding = (findingID, checked) => {
++        setSelectedFindingIDs((prev) => {
++            if (checked) {
++                return prev.includes(findingID) ? prev : [...prev, findingID];
++            }
++            return prev.filter((id) => id !== findingID);
++        });
++        setPreviewData(null);
++        setApplyResult(null);
++    };
++
++    const refreshSectionAfterApply = async (section, findingsForRefresh) => {
++        const res = await axios.post('/project/accessibility/remedy/scan', {
++            projectID: props.match.params.id,
++            sectionID: section._id,
++            sectionURL: section.sectionURL,
++            pageID: section.pageID,
++            sectionTitle: section.sectionTitle,
+         });
++        if (res.data.err) {
++            throw (new Error(res.data.errMsg));
++        }
++        const criteria = res.data.criteria || {};
++        const nextFindings = Array.isArray(res.data.findings) ? res.data.findings : [];
++        mergeSectionWcagState(
++            section._id,
++            getWcagReviewFromResponse(res.data),
++            getDojExceptionsFromResponse(res.data),
++        );
++        const affectedCriteria = getAffectedCriteriaKeys(findingsForRefresh);
++        mergeSectionLegacyCriteria(section._id, criteria, affectedCriteria, { onlyWhenMissing: false });
++        await persistLegacyCriteriaUpdates({ suppressError: true });
++
++        setRemedyFindingsBySection((prev) => ({
++            ...prev,
++            [section._id]: nextFindings,
++        }));
++        schedulePersistA11yProgress(reviewSectionsRef.current);
++    };
++
++    const previewRemedyFix = async () => {
++        if (!activeFixSection || (remedyFixMode === 'deterministic' && selectedFindingIDs.length === 0)) {
++            return;
++        }
++        setPreviewLoading(true);
++        setPreviewData(null);
++        setApplyResult(null);
++        try {
++            await ensureRemedyServerReady();
++            const findingIDs = selectedFindingIDs.length > 0
++                ? selectedFindingIDs
++                : getSectionFixableFindings(activeFixSection._id).map((finding) => finding.id);
++            const res = await axios.post('/project/accessibility/remedy/preview', {
++                projectID: props.match.params.id,
++                sectionURL: activeFixSection.sectionURL,
++                pageID: activeFixSection.pageID,
++                findingIDs,
++                fixMode: remedyFixMode,
++                tier: remedyFixMode === 'pipeline' ? pipelineTier : undefined,
++            });
++            if (res.data.err) {
++                throw (new Error(res.data.errMsg));
++            }
++            setPreviewData(res.data);
++        } catch (err) {
++            handleGlobalError(err);
++        } finally {
++            setPreviewLoading(false);
++        }
++    };
++
++    const applyRemedyFix = async () => {
++        if (!activeFixSection || !previewData || (remedyFixMode === 'deterministic' && selectedFindingIDs.length === 0)) {
++            return;
++        }
++        setApplyLoading(true);
++        setApplyResult(null);
++        try {
++            await ensureRemedyServerReady();
++            const findingIDs = selectedFindingIDs.length > 0
++                ? selectedFindingIDs
++                : getSectionFixableFindings(activeFixSection._id).map((finding) => finding.id);
++            const res = await axios.post('/project/accessibility/remedy/apply', {
++                projectID: props.match.params.id,
++                sectionURL: activeFixSection.sectionURL,
++                pageID: activeFixSection.pageID,
++                findingIDs,
++                previewHash: previewData.preview_hash,
++                previewToken: previewData.preview_token || previewData.previewToken,
++                fixMode: remedyFixMode,
++                tier: remedyFixMode === 'pipeline' ? pipelineTier : undefined,
++            });
++            if (res.data.err) {
++                throw (new Error(res.data.errMsg));
++            }
++            const refreshFindings = remedyFixMode === 'pipeline'
++                ? getSectionFixableFindings(activeFixSection._id)
++                : getSectionFixableFindings(activeFixSection._id)
++                    .filter((finding) => selectedFindingIDs.includes(finding.id));
++            await refreshSectionAfterApply(activeFixSection, refreshFindings);
++            setApplyResult(res.data);
++        } catch (err) {
++            handleGlobalError(err);
++        } finally {
++            setApplyLoading(false);
++        }
+     };
+ 
+     const openAddModal = () => {
+@@ -265,7 +1383,7 @@ const ProjectAccessibility = (props) => {
+         axios.put('/project/accessibility/importsections', data).then((res) => {
+             if (!res.data.err) {
+                 closeSyncTOCModal();
+-                getReviewSections();
++                getReviewSections({ persistScore: true });
+             } else {
+                 handleGlobalError(res.data.errMsg);
+                 setSyncTOCLoading(false);
+@@ -276,6 +1394,35 @@ const ProjectAccessibility = (props) => {
+         });
+     };
+ 
++    const activeFixFindings = activeFixSection ? getSectionFixableFindings(activeFixSection._id) : [];
++    const selectedFixableFindings = activeFixFindings.filter((finding) => selectedFindingIDs.includes(finding.id));
++    const hasFailedScanSections = scanFailures.some((failure) => typeof (failure.sectionID) === 'string' && failure.sectionID.length > 0);
++    const isPipelineFixMode = remedyFixMode === 'pipeline';
++    const canRunRemedyFixActions = activeFixSection && !fixActionsBlocked;
++    const canPreviewRemedyFix = canRunRemedyFixActions && (isPipelineFixMode || selectedFindingIDs.length > 0);
++    const canApplyRemedyFix = canRunRemedyFixActions
++        && previewData
++        && !previewData.noise_only_change
++        && !applyResult
++        && (isPipelineFixMode || selectedFixableFindings.length > 0);
++    const pipelineTierOptions = [
++        { key: 1, value: 1, text: 'Tier 1' },
++        { key: 2, value: 2, text: 'Tier 2' },
++        { key: 3, value: 3, text: 'Tier 3' },
++    ];
++    const wcagScoreSummary = computeWcagProjectSummary(reviewSections);
++    const legacyScoreSummary = computeA11yScore(reviewSections);
++    const hasWcagReviews = wcagScoreSummary.reviewedPageCount > 0;
++    const scorePercent = hasWcagReviews ? wcagScoreSummary.score : legacyScoreSummary.percent;
++    const scoreDisplay = hasWcagReviews
++        ? (wcagScoreSummary.score === null ? 'N/A' : `${wcagScoreSummary.score}%`)
++        : (legacyScoreSummary.populatedCount > 0 ? `${legacyScoreSummary.percent}%` : 'N/A');
++    const scoreClass = scorePercent === null || (!hasWcagReviews && legacyScoreSummary.populatedCount === 0)
++        ? 'project-yellow-score'
++        : (scorePercent > 75
++            ? 'project-green-score'
++            : (scorePercent > 50 ? 'project-yellow-score' : 'project-red-score'));
++
+     return(
+         <Grid className='component-container' divided='vertically'>
+             <Grid.Row>
+@@ -363,17 +1510,28 @@ const ProjectAccessibility = (props) => {
+                                     {canViewDetails &&
+                                         <Grid.Column>
+                                             <Header as='h2' dividing className='mt-1p'>Accessibility Compliance Review Matrix</Header>
+-                                            <Segment className='flex-row-div mt-1p'>
+-                                                <div className='left-flex'>
++                                            <Segment className='flex-row-div mt-1p wcag-summary-segment'>
++                                                <div className='left-flex wcag-summary-main'>
+                                                     <p id='project-accessibility-score-header'>
+-                                                        Accessibility Score: <span className='project-yellow-score'>N/A</span>
+-                                                            {/*<span className={accessScore > 50 ? (accessScore > 75 ? 'project-green-score' : 'project-yellow-score') : 'project-red-score'}>{accessScore}%</span>*/}
++                                                        Accessibility Score: <span className={scoreClass}>{scoreDisplay}</span>
++                                                    </p>
++                                                    <p className='wcag-workflow-note'>
++                                                        Remedy scans each page against DOJ Title II WCAG 2.1 A/AA. Fails are issues Remedy found automatically; manual review, not tested, not applicable, and verified exceptions are shown separately.
+                                                     </p>
+                                                 </div>
+-                                                <div className='right-flex'>
++                                                <div className='right-flex wcag-summary-actions'>
++                                                    <Button
++                                                        color='green'
++                                                        disabled={reviewSections.length === 0 || scanLoading}
++                                                        loading={scanLoading}
++                                                        onClick={openScanModal}
++                                                    >
++                                                        <Icon name='magic' />
++                                                        Scan with Remedy
++                                                    </Button>
+                                                     {(!isEmptyString(project.projectURL)
+-                                                        && !isEmptyString(project.libreLibrary)
+-                                                        && !isEmptyString(project.libreCoverID)
++                                                        || (!isEmptyString(project.libreLibrary)
++                                                            && !isEmptyString(project.libreCoverID))
+                                                         ) ? (
+                                                             <Button
+                                                                 color='blue'
+@@ -399,7 +1557,14 @@ const ProjectAccessibility = (props) => {
+                                                     }
+                                                 </div>
+                                             </Segment>
+-                                            <div className='access-table-outer'>
++                                            <WcagReviewTable
++                                                sections={reviewSections}
++                                                getSectionFixableIssueCount={getSectionFixableIssueCount}
++                                                fixScanSectionID={fixScanSectionID}
++                                                openFixModal={openFixModal}
++                                                openAddModal={openAddModal}
++                                            />
++                                            <div className='access-table-outer access-table-legacy-hidden'>
+                                                 <div className='access-table-inner'>
+                                                     <Table celled structured className='mt-1p' id='access-table'>
+                                                         <Table.Header>
+@@ -429,6 +1594,7 @@ const ProjectAccessibility = (props) => {
+                                                                 <Table.HeaderCell colSpan={1} textAlign='center'>Sensory Characteristics</Table.HeaderCell>
+                                                                 <Table.HeaderCell colSpan={1} textAlign='center'>Timing</Table.HeaderCell>
+                                                                 <Table.HeaderCell colSpan={1} textAlign='center'>Computer Code</Table.HeaderCell>
++                                                                <Table.HeaderCell rowSpan={2} textAlign='center'>Remedy</Table.HeaderCell>
+                                                             </Table.Row>
+                                                             <Table.Row>
+                                                                 {/* NAV */}
+@@ -567,6 +1733,8 @@ const ProjectAccessibility = (props) => {
+                                                         <Table.Body id='access-table-body'>
+                                                             {(reviewSections.length > 0 ) &&
+                                                                 reviewSections.map((item) => {
++                                                                    const fixableIssueCount = getSectionFixableIssueCount(item);
++                                                                    const isLoadingFixFindings = fixScanSectionID === item._id;
+                                                                     return (
+                                                                         <Table.Row verticalAlign='middle' key={item._id}>
+                                                                             <Table.Cell>
+@@ -693,6 +1861,19 @@ const ProjectAccessibility = (props) => {
+                                                                             <Table.Cell className='access-table-cell' textAlign='center'>
+                                                                                 <Checkbox toggle checked={item.codeAltText} onChange={(_e, data) => { updateSectionItem(item._id, 'codeAltText', data.checked) }} />
+                                                                             </Table.Cell>
++                                                                            <Table.Cell textAlign='center'>
++                                                                                {fixableIssueCount > 0 && (
++                                                                                    <Button
++                                                                                        compact
++                                                                                        color='red'
++                                                                                        icon='wrench'
++                                                                                        content={`Fix ${fixableIssueCount}`}
++                                                                                        loading={isLoadingFixFindings}
++                                                                                        disabled={Boolean(fixScanSectionID)}
++                                                                                        onClick={() => openFixModal(item)}
++                                                                                    />
++                                                                                )}
++                                                                            </Table.Cell>
+                                                                         </Table.Row>
+                                                                     )
+                                                                 })
+@@ -700,7 +1881,7 @@ const ProjectAccessibility = (props) => {
+                                                             {(reviewSections.length === 0) &&
+                                                                 <Table.Row>
+                                                                     <Table.Cell></Table.Cell>
+-                                                                    <Table.Cell colSpan={33}>
++                                                                    <Table.Cell colSpan={34}>
+                                                                         <span><em>No sections added yet.</em></span>
+                                                                     </Table.Cell>
+                                                                 </Table.Row>
+@@ -727,6 +1908,188 @@ const ProjectAccessibility = (props) => {
+                             </Grid>
+                         </Segment>
+                     </Segment.Group>
++                    {/* Remedy Scan Modal */}
++                    <Modal
++                        open={showScanModal}
++                        onClose={closeScanModal}
++                    >
++                        <Modal.Header>Scan with Remedy</Modal.Header>
++                        <Modal.Content>
++                            <p>
++                                {hasFailedScanSections
++                                    ? 'This will retry only the pages that failed in the last Remedy scan.'
++                                    : 'This will scan all synced pages with Remedy, store the WCAG 2.1 A/AA review, and keep legacy checkbox values for compatibility.'}
++                            </p>
++                            {scanProgress.total > 0 && (
++                                <p>
++                                    <strong>Progress:</strong> {scanProgress.completed} of {scanProgress.total}
++                                    {!isEmptyString(scanProgress.currentTitle) ? ` — ${scanProgress.currentTitle}` : ''}
++                                </p>
++                            )}
++                            {scanFailures.length > 0 && (
++                                <Segment color='yellow' className='mt-1p'>
++                                    <Header as='h4'>Completed with some skipped pages</Header>
++                                    <p>{scanFailures.length} page(s) failed to scan. The rest of the matrix updates were saved.</p>
++                                    <ul>
++                                        {scanFailures.slice(0, 8).map((failure) => (
++                                            <li key={failure.sectionID || failure.sectionTitle}>
++                                                <strong>{failure.sectionTitle || 'Untitled section'}:</strong> {failure.message}
++                                            </li>
++                                        ))}
++                                    </ul>
++                                    {scanFailures.length > 8 && (
++                                        <p>Showing the first 8 failures.</p>
++                                    )}
++                                </Segment>
++                            )}
++                        </Modal.Content>
++                        <Modal.Actions>
++                            <Button
++                                disabled={scanLoading}
++                                onClick={closeScanModal}
++                            >
++                                Cancel
++                            </Button>
++                            <Button
++                                color='green'
++                                loading={scanLoading}
++                                onClick={scanWithRemedy}
++                            >
++                                <Icon name='magic' />
++                                {hasFailedScanSections ? 'Resume Scan' : 'Start Scan'}
++                            </Button>
++                        </Modal.Actions>
++                    </Modal>
++                    {/* Remedy Fix Modal */}
++                    <Modal
++                        open={showFixModal}
++                        onClose={closeFixModal}
++                        closeOnDimmerClick={!previewLoading && !applyLoading}
++                    >
++                        <Modal.Header>Fix Issues with Remedy</Modal.Header>
++                        <Modal.Content scrolling>
++                            {activeFixSection && (
++                                <>
++                                    <p><strong>Section:</strong> {activeFixSection.sectionTitle}</p>
++                                    <Segment className='remedy-fix-explainer'>
++                                        <Header as='h4'>What Remedy will do</Header>
++                                        <div className='remedy-workflow-steps'>
++                                            <div><strong>1.</strong> {isPipelineFixMode ? 'Run a page-wide pipeline preview.' : 'Use the checked findings below.'}</div>
++                                            <div><strong>2.</strong> Preview the exact HTML changes without writing to the book.</div>
++                                            <div><strong>3.</strong> Apply the approved changes, then rescan this page.</div>
++                                        </div>
++                                    </Segment>
++                                    {!isEmptyString(fixModalMessage) && (
++                                        <Segment color={fixActionsBlocked ? 'red' : 'yellow'} className='mt-1p'>
++                                            {fixModalMessage}
++                                        </Segment>
++                                    )}
++                                    <Form className='remedy-mode-form'>
++                                        <Form.Group grouped>
++                                            <label>Fix mode</label>
++                                            <Form.Field>
++                                                <Checkbox
++                                                    radio
++                                                    checked={remedyFixMode === 'deterministic'}
++                                                    disabled={fixActionsBlocked || previewLoading || applyLoading}
++                                                    label='Selected targeted fixes'
++                                                    onChange={() => changeRemedyFixMode('deterministic')}
++                                                />
++                                            </Form.Field>
++                                            <Form.Field>
++                                                <Checkbox
++                                                    radio
++                                                    checked={isPipelineFixMode}
++                                                    disabled={fixActionsBlocked || previewLoading || applyLoading}
++                                                    label='Advanced page-wide pipeline preview'
++                                                    onChange={() => changeRemedyFixMode('pipeline')}
++                                                />
++                                            </Form.Field>
++                                            {isPipelineFixMode && (
++                                                <Form.Select
++                                                    label='Pipeline tier'
++                                                    options={pipelineTierOptions}
++                                                    value={pipelineTier}
++                                                    disabled={fixActionsBlocked || previewLoading || applyLoading}
++                                                    onChange={(_e, data) => changePipelineTier(data.value)}
++                                                />
++                                            )}
++                                        </Form.Group>
++                                    </Form>
++                                    {activeFixFindings.length > 0 ? (
++                                        <Form className='remedy-findings-form'>
++                                            {activeFixFindings.map((finding) => {
++                                                const wcagIDs = getFindingWcagIDs(finding);
++                                                return (
++                                                    <Form.Field key={finding.id} className='remedy-finding-field'>
++                                                        <Checkbox
++                                                            checked={selectedFindingIDs.includes(finding.id)}
++                                                            disabled={isPipelineFixMode}
++                                                            label={(
++                                                                <label>
++                                                                    {finding.message}
++                                                                    {wcagIDs.length > 0 && (
++                                                                        <span className='muted-text'> · WCAG {wcagIDs.join(', ')}</span>
++                                                                    )}
++                                                                </label>
++                                                            )}
++                                                            onChange={(_e, data) => toggleSelectedFinding(finding.id, data.checked)}
++                                                        />
++                                                        <div className='remedy-finding-actions'>
++                                                            {finding.selector && <code>{finding.selector}</code>}
++                                                            <EvidenceBookLink section={activeFixSection} evidence={finding} compact />
++                                                        </div>
++                                                    </Form.Field>
++                                                );
++                                            })}
++                                        </Form>
++                                    ) : (
++                                        <p className='muted-text mt-1p'>No current deterministic Remedy findings are available for this page.</p>
++                                    )}
++                                    <Button
++                                        as='a'
++                                        href={activeFixSection.sectionURL}
++                                        target='_blank'
++                                        rel='noopener noreferrer'
++                                        className='mt-1p'
++                                    >
++                                        Open full page in book
++                                        <Icon name='external' />
++                                    </Button>
++                                    <PreviewDiffPanel
++                                        previewData={previewData}
++                                        selectedCount={selectedFindingIDs.length}
++                                        panelRef={previewPanelRef}
++                                    />
++                                    <ApplyResultPanel applyResult={applyResult} />
++                                </>
++                            )}
++                        </Modal.Content>
++                        <Modal.Actions>
++                            <Button
++                                disabled={previewLoading || applyLoading}
++                                onClick={closeFixModal}
++                            >
++                                Close
++                            </Button>
++                            <Button
++                                color='blue'
++                                disabled={!canPreviewRemedyFix || applyLoading}
++                                loading={previewLoading}
++                                onClick={previewRemedyFix}
++                            >
++                                {previewData ? 'Refresh preview' : 'Preview changes'}
++                            </Button>
++                            <Button
++                                color='green'
++                                disabled={!canApplyRemedyFix}
++                                loading={applyLoading}
++                                onClick={applyRemedyFix}
++                            >
++                                Apply to LibreTexts
++                            </Button>
++                        </Modal.Actions>
++                    </Modal>
+                     {/* Add Section Modal */}
+                     <Modal
+                         open={showAddModal}
+diff --git a/client/src/components/projects/Projects.css b/client/src/components/projects/Projects.css
+index 92697bfb..e033c32c 100644
+--- a/client/src/components/projects/Projects.css
++++ b/client/src/components/projects/Projects.css
+@@ -122,9 +122,390 @@
+     font-weight: normal;
+ }
+ 
++.access-table-legacy-hidden {
++    display: none;
++}
++
++.muted-text {
++    color: #6c757d;
++}
++
++.wcag-review-list {
++    margin-top: 1em;
++}
++
++.wcag-review-table {
++    margin-top: 0 !important;
++}
++
++.wcag-review-table td {
++    vertical-align: top;
++}
++
++.wcag-page-title {
++    overflow-wrap: anywhere;
++}
++
++.wcag-summary-segment {
++    align-items: flex-start;
++    gap: 2.5em;
++}
++
++.wcag-summary-main {
++    display: grid;
++    gap: 0.75em;
++}
++
++.wcag-summary-actions {
++    align-items: flex-start;
++    display: flex;
++    flex-wrap: wrap;
++    gap: 0.5em;
++    justify-content: flex-end;
++}
++
++
++.wcag-workflow-note {
++    color: #555;
++    margin: 0;
++    max-width: 820px;
++}
++
++.wcag-page-metric {
++    min-width: 92px;
++    text-align: center;
++}
++
++.wcag-page-metric strong {
++    display: block;
++    font-size: 1.15em;
++}
++
++.wcag-page-metric span {
++    display: block;
++    color: #5f6b78;
++    font-size: 0.86em;
++    font-weight: 600;
++    line-height: 1.2;
++}
++
++.wcag-page-metric small {
++    color: #6c757d;
++    display: block;
++    font-size: 0.76em;
++    line-height: 1.25;
++    margin-top: 0.25em;
++}
++
++.wcag-page-metric.metric-error strong {
++    color: #DB2828;
++}
++
++.wcag-page-metric.metric-warning strong {
++    color: #FBBD08;
++}
++
++.wcag-section-summary-row > td {
++    border-bottom: 0 !important;
++}
++
++.wcag-section-details-row > td {
++    border-top: 0 !important;
++}
++
++.wcag-details-cell {
++    background: #FFFFFF;
++    padding-top: 0 !important;
++}
++
++.wcag-section-details {
++    background: #FAFAFA;
++    border: 1px solid rgba(34,36,38,.12);
++    border-radius: 4px;
++    padding: 0.85em 1em;
++}
++
++.wcag-section-details summary {
++    cursor: pointer;
++    font-weight: 600;
++}
++
++.wcag-section-details-title strong {
++    overflow-wrap: anywhere;
++}
++
++.wcag-principle-group {
++    margin-top: 1em;
++}
++
++.wcag-principle-group h4.ui.header {
++    margin-bottom: 0.5em;
++}
++
++.wcag-criteria-grid {
++    display: grid;
++    grid-template-columns: repeat(2, minmax(0, 1fr));
++    gap: 0.75em;
++}
++
++.wcag-criterion-card {
++    border: 1px solid rgba(34,36,38,.15);
++    border-left-width: 4px;
++    border-radius: 4px;
++    background: #fff;
++    padding: 0.75em;
++}
++
++.wcag-criterion-pass {
++    border-left-color: #21BA45;
++}
++
++.wcag-criterion-fail {
++    border-left-color: #DB2828;
++}
++
++.wcag-criterion-manual_review {
++    border-left-color: #FBBD08;
++}
++
++.wcag-criterion-not_tested {
++    border-left-color: #2185D0;
++}
++
++.wcag-criterion-not_applicable {
++    border-left-color: #767676;
++}
++
++.wcag-criterion-title {
++    display: grid;
++    grid-template-columns: auto auto minmax(0, 1fr) auto;
++    gap: 0.4em;
++    align-items: center;
++}
++
++.wcag-criterion-title span:not(.wcag-status-pill):not(.wcag-level) {
++    overflow-wrap: anywhere;
++}
++
++.wcag-criterion-card p {
++    margin: 0.5em 0;
++    color: #555;
++}
++
++.wcag-criterion-card code {
++    display: inline-block;
++    color: #555;
++    overflow-wrap: anywhere;
++    white-space: normal;
++}
++
++.wcag-evidence-list {
++    list-style-position: outside;
++    margin: 0.5em 0 0 1.15em;
++    padding: 0;
++}
++
++.wcag-evidence-item {
++    margin-bottom: 0.85em;
++}
++
++.wcag-evidence-message {
++    margin-bottom: 0.35em;
++}
++
++.wcag-evidence-badge {
++    border-radius: 3px;
++    display: inline-block;
++    font-size: 0.78em;
++    font-weight: 600;
++    line-height: 1.2;
++    margin-left: 0.45em;
++    padding: 0.2em 0.45em;
++}
++
++.wcag-evidence-badge-warning {
++    background: #FFF6DB;
++    color: #8A5A00;
++}
++
++.wcag-evidence-actions {
++    align-items: center;
++    display: flex;
++    flex-wrap: wrap;
++    gap: 0.5em;
++}
++
++.wcag-evidence-snippet {
++    margin-top: 0.35em;
++}
++
++.wcag-evidence-snippet summary {
++    cursor: pointer;
++}
++
++.wcag-status-pill,
++.wcag-level {
++    border-radius: 3px;
++    display: inline-block;
++    font-size: 0.78em;
++    line-height: 1;
++    padding: 0.28em 0.45em;
++    white-space: nowrap;
++}
++
++.wcag-level {
++    border: 1px solid rgba(34,36,38,.15);
++    color: #6c757d;
++}
++
++.wcag-status-pass {
++    background: #E5F9E7;
++    color: #1B7F35;
++}
++
++.wcag-status-fail {
++    background: #FFE8E6;
++    color: #DB2828;
++}
++
++.wcag-status-manual_review {
++    background: #FFF8DB;
++    color: #8A6D00;
++}
++
++.wcag-status-not_tested {
++    background: #DFF0FF;
++    color: #2185D0;
++}
++
++.wcag-status-not_applicable {
++    background: #F1F1F1;
++    color: #767676;
++}
++
++.remedy-fix-explainer {
++    background: #F8FAFC !important;
++}
++
++.remedy-workflow-steps {
++    display: grid;
++    gap: 0.45em;
++}
++
++.remedy-mode-form {
++    margin: 1em 0;
++}
++
++.remedy-mode-form .grouped.fields {
++    margin-bottom: 0;
++}
++
++.remedy-findings-form {
++    margin-top: 1em;
++}
++
++.remedy-finding-field {
++    border-bottom: 1px solid rgba(34,36,38,.1);
++    padding-bottom: 0.85em;
++}
++
++.remedy-finding-actions {
++    align-items: center;
++    display: flex;
++    flex-wrap: wrap;
++    gap: 0.5em;
++    margin-left: 2.1em;
++    margin-top: 0.35em;
++}
++
++.remedy-finding-actions code {
++    color: #555;
++    overflow-wrap: anywhere;
++    white-space: normal;
++}
++
++.remedy-preview-summary {
++    display: grid;
++    gap: 0.75em;
++    grid-template-columns: repeat(4, minmax(0, 1fr));
++}
++
++.remedy-preview-metric {
++    background: #FAFAFA;
++    border: 1px solid rgba(34,36,38,.12);
++    border-radius: 4px;
++    padding: 0.75em;
++}
++
++.remedy-preview-metric strong,
++.remedy-preview-metric span {
++    display: block;
++}
++
++.remedy-preview-metric strong {
++    font-size: 1.2em;
++}
++
++.remedy-preview-metric span {
++    color: #6c757d;
++    font-size: 0.82em;
++    text-transform: uppercase;
++}
++
++.remedy-rule-summary {
++    display: grid;
++    gap: 0.35em;
++    margin-top: 0.85em;
++}
++
++.remedy-diff-details {
++    margin-top: 0.85em;
++}
++
++.remedy-diff-details summary {
++    cursor: pointer;
++    font-weight: 600;
++}
++
++.remedy-diff {
++    background: #161B22;
++    border-radius: 4px;
++    color: #D0D7DE;
++    font-size: 0.88em;
++    line-height: 1.45;
++    max-height: 360px;
++    overflow: auto;
++    padding: 1em;
++    white-space: pre;
++}
++
++.remedy-diff-add {
++    color: #7EE787;
++}
++
++.remedy-diff-del {
++    color: #FFA198;
++}
++
++.remedy-diff-meta {
++    color: #79C0FF;
++}
++
++.remedy-diff-empty {
++    margin-top: 0.5em;
++}
++
++@media (max-width: 900px) {
++    .wcag-criteria-grid,
++    .remedy-preview-summary {
++        grid-template-columns: 1fr;
++    }
++}
++
+ #project-accessibility-score-header {
+     font-size: 1.18em;
+     font-weight: 600;
++    margin: 0;
+ }
+ 
+ .project-green-score {
+@@ -450,4 +831,4 @@
+ 
+ .disabled-page-tag i.delete.icon {
+     display: none !important;
+-}
+\ No newline at end of file
++}
+diff --git a/client/src/components/projects/accessibilityScore.test.ts b/client/src/components/projects/accessibilityScore.test.ts
+new file mode 100644
+index 00000000..98a19547
+--- /dev/null
++++ b/client/src/components/projects/accessibilityScore.test.ts
+@@ -0,0 +1,162 @@
++import { expect, test } from "vitest";
++
++import { computeA11yScore, computeWcagProjectSummary } from "./accessibilityScore";
++
++test("computeA11yScore returns zeroes for no populated cells", () => {
++  const result = computeA11yScore([{ sectionTitle: "One", sectionURL: "/one" }]);
++  expect(result).toEqual({
++    passingCount: 0,
++    populatedCount: 0,
++    percent: 0,
++  });
++});
++
++test("computeA11yScore ignores undefined cells", () => {
++  const result = computeA11yScore([
++    {
++      sectionTitle: "One",
++      imgAltText: true,
++      headingOutline: false,
++      formFieldLabels: undefined,
++    },
++  ]);
++  expect(result.populatedCount).toBe(2);
++  expect(result.passingCount).toBe(1);
++  expect(result.percent).toBe(50);
++});
++
++test("computeA11yScore returns 100 for all populated true", () => {
++  const result = computeA11yScore([
++    {
++      imgAltText: true,
++      headingOutline: true,
++      formFieldLabels: true,
++      tableHeaders: true,
++    },
++  ]);
++  expect(result.populatedCount).toBe(4);
++  expect(result.passingCount).toBe(4);
++  expect(result.percent).toBe(100);
++});
++
++test("computeA11yScore rounds mixed results", () => {
++  const result = computeA11yScore([
++    {
++      imgAltText: true,
++      headingOutline: false,
++      formFieldLabels: false,
++    },
++    {
++      tableHeaders: true,
++    },
++  ]);
++  expect(result.populatedCount).toBe(4);
++  expect(result.passingCount).toBe(2);
++  expect(result.percent).toBe(50);
++});
++
++test("computeA11yScore includes expanded Remedy scanner criteria", () => {
++  const result = computeA11yScore([
++    {
++      imgDecorative: false,
++      imgShortAlt: true,
++      linkExtLabeled: false,
++      tableLabel: true,
++      listOlLabel: false,
++      listUlLabel: true,
++      docLinkFile: false,
++    },
++  ]);
++
++  expect(result.populatedCount).toBe(7);
++  expect(result.passingCount).toBe(3);
++  expect(result.percent).toBe(43);
++});
++
++test("computeWcagProjectSummary aggregates stored WCAG review summaries", () => {
++  const result = computeWcagProjectSummary([
++    {
++      sectionTitle: "01: Introduction",
++      wcagReview: {
++        summary: {
++          scorePassCount: 8,
++          scoreFailCount: 2,
++          failCount: 2,
++          manualReviewCount: 4,
++          notTestedCount: 1,
++          verifiedExceptionCount: 1,
++          notApplicableCount: 12,
++        },
++      },
++    },
++    {
++      sectionTitle: "1.01: Studying Chemistry",
++      wcag_review: {
++        summary: {
++          scorePassCount: 6,
++          scoreFailCount: 4,
++          failCount: 4,
++          manualReviewCount: 3,
++          notTestedCount: 0,
++          verifiedExceptionCount: 2,
++          notApplicableCount: 10,
++        },
++      },
++    },
++    {
++      sectionTitle: "Unscanned page",
++    },
++  ]);
++
++  expect(result.reviewedPageCount).toBe(2);
++  expect(result.scorePassCount).toBe(14);
++  expect(result.scoreFailCount).toBe(6);
++  expect(result.scoreDenominator).toBe(20);
++  expect(result.score).toBe(70);
++  expect(result.failCount).toBe(6);
++  expect(result.manualReviewCount).toBe(7);
++  expect(result.notTestedCount).toBe(1);
++  expect(result.verifiedExceptionCount).toBe(3);
++  expect(result.notApplicableCount).toBe(22);
++});
++
++test("computeWcagProjectSummary excludes manual review and untested counts from score denominator", () => {
++  const result = computeWcagProjectSummary([
++    {
++      wcagReview: {
++        summary: {
++          scorePassCount: 1,
++          scoreFailCount: 1,
++          manualReviewCount: 48,
++          notTestedCount: 50,
++          notApplicableCount: 25,
++          verifiedExceptionCount: 5,
++        },
++      },
++    },
++  ]);
++
++  expect(result.scoreDenominator).toBe(2);
++  expect(result.score).toBe(50);
++  expect(result.manualReviewCount).toBe(48);
++  expect(result.notTestedCount).toBe(50);
++});
++
++test("computeWcagProjectSummary reports null score when only not-applicable/manual states exist", () => {
++  const result = computeWcagProjectSummary([
++    {
++      wcagReview: {
++        summary: {
++          scorePassCount: 0,
++          scoreFailCount: 0,
++          manualReviewCount: 4,
++          notApplicableCount: 46,
++        },
++      },
++    },
++  ]);
++
++  expect(result.reviewedPageCount).toBe(1);
++  expect(result.scoreDenominator).toBe(0);
++  expect(result.score).toBe(null);
++});
+diff --git a/client/src/components/projects/accessibilityScore.ts b/client/src/components/projects/accessibilityScore.ts
+new file mode 100644
+index 00000000..0dbb35a0
+--- /dev/null
++++ b/client/src/components/projects/accessibilityScore.ts
+@@ -0,0 +1,155 @@
++export const A11Y_SCORE_KEYS = [
++  "navKeyboard",
++  "imgAltText",
++  "imgDecorative",
++  "imgShortAlt",
++  "linkNoneEmpty",
++  "linkSuspicious",
++  "linkExtLabeled",
++  "contrastSmall",
++  "contrastLarge",
++  "contrastButtons",
++  "textSize",
++  "textLineHeight",
++  "textParSpacing",
++  "textLetterSpacing",
++  "textWordSpacing",
++  "headingNoneEmpty",
++  "headingOutline",
++  "formFieldLabels",
++  "formNavRadio",
++  "tableHeaders",
++  "tableLabel",
++  "tableNotImage",
++  "listOlLabel",
++  "listUlLabel",
++  "docLinkFile",
++  "docAccess",
++  "multiCaption",
++  "multiNavControls",
++  "multiAudioTrans",
++  "multiAudioDescrip",
++  "divSection",
++  "senseInstruction",
++  "timingCriteria",
++  "codeAltText",
++] as const;
++
++export type A11yScoreSummary = {
++  passingCount: number;
++  populatedCount: number;
++  percent: number;
++};
++
++export type WcagProjectSummary = {
++  reviewedPageCount: number;
++  score: number | null;
++  scorePassCount: number;
++  scoreFailCount: number;
++  scoreDenominator: number;
++  failCount: number;
++  manualReviewCount: number;
++  notTestedCount: number;
++  verifiedExceptionCount: number;
++  notApplicableCount: number;
++};
++
++export function computeA11yScore(
++  reviewSections: Array<Record<string, unknown>>,
++): A11yScoreSummary {
++  let passingCount = 0;
++  let populatedCount = 0;
++
++  reviewSections.forEach((section) => {
++    A11Y_SCORE_KEYS.forEach((key) => {
++      const value = section[key];
++      if (typeof value === "boolean") {
++        populatedCount += 1;
++        if (value) {
++          passingCount += 1;
++        }
++      }
++    });
++  });
++
++  return {
++    passingCount,
++    populatedCount,
++    percent:
++      populatedCount > 0
++        ? Math.round((passingCount / populatedCount) * 100)
++        : 0,
++  };
++}
++
++function getSectionWcagReview(section: Record<string, unknown>) {
++  return (
++    (section.wcagReview as Record<string, unknown> | undefined)
++    || (section.wcag_review as Record<string, unknown> | undefined)
++    || null
++  );
++}
++
++function readSummaryCount(summary: Record<string, unknown>, key: string): number {
++  const value = summary[key];
++  return typeof value === "number" && Number.isFinite(value) ? value : 0;
++}
++
++export function computeWcagProjectSummary(
++  reviewSections: Array<Record<string, unknown>>,
++): WcagProjectSummary {
++  const summary: WcagProjectSummary = {
++    reviewedPageCount: 0,
++    score: null,
++    scorePassCount: 0,
++    scoreFailCount: 0,
++    scoreDenominator: 0,
++    failCount: 0,
++    manualReviewCount: 0,
++    notTestedCount: 0,
++    verifiedExceptionCount: 0,
++    notApplicableCount: 0,
++  };
++
++  reviewSections.forEach((section) => {
++    const review = getSectionWcagReview(section);
++    const reviewSummary = review?.summary;
++    if (!reviewSummary || typeof reviewSummary !== "object") return;
++
++    summary.reviewedPageCount += 1;
++    summary.scorePassCount += readSummaryCount(
++      reviewSummary as Record<string, unknown>,
++      "scorePassCount",
++    );
++    summary.scoreFailCount += readSummaryCount(
++      reviewSummary as Record<string, unknown>,
++      "scoreFailCount",
++    );
++    summary.failCount += readSummaryCount(
++      reviewSummary as Record<string, unknown>,
++      "failCount",
++    );
++    summary.manualReviewCount += readSummaryCount(
++      reviewSummary as Record<string, unknown>,
++      "manualReviewCount",
++    );
++    summary.notTestedCount += readSummaryCount(
++      reviewSummary as Record<string, unknown>,
++      "notTestedCount",
++    );
++    summary.verifiedExceptionCount += readSummaryCount(
++      reviewSummary as Record<string, unknown>,
++      "verifiedExceptionCount",
++    );
++    summary.notApplicableCount += readSummaryCount(
++      reviewSummary as Record<string, unknown>,
++      "notApplicableCount",
++    );
++  });
++
++  summary.scoreDenominator = summary.scorePassCount + summary.scoreFailCount;
++  summary.score = summary.scoreDenominator > 0
++    ? Math.round((summary.scorePassCount / summary.scoreDenominator) * 100)
++    : null;
++  return summary;
++}
+diff --git a/client/src/types/a11y.ts b/client/src/types/a11y.ts
+index e355b59a..bb10ac7e 100644
+--- a/client/src/types/a11y.ts
++++ b/client/src/types/a11y.ts
+@@ -1,6 +1,7 @@
+ export type a11ySectionReviewSchema = {
+   sectionTitle: string;
+   sectionURL: string;
++  pageID?: string;
+   navKeyboard: boolean;
+   imgAltText: boolean;
+   imgDecorative: boolean;
+@@ -35,4 +36,85 @@ export type a11ySectionReviewSchema = {
+   senseInstruction: boolean;
+   timingCriteria: boolean;
+   codeAltText: boolean;
++  wcagReview?: WcagReview;
++  dojExceptions?: DojException[];
++  remedyStatus?: string;
++  remedyLastScannedAt?: string;
++  remedyFindings?: unknown[];
++  remedyWcagSummary?: Record<string, unknown>;
++  remedyError?: string;
++};
++
++export type WcagCriterionStatus =
++  | "pass"
++  | "fail"
++  | "not_applicable"
++  | "manual_review"
++  | "not_tested";
++
++export type WcagPrinciple =
++  | "Perceivable"
++  | "Operable"
++  | "Understandable"
++  | "Robust";
++
++export type WcagCriterionResult = {
++  id: string;
++  title: string;
++  level: "A" | "AA";
++  principle: WcagPrinciple;
++  status: WcagCriterionStatus;
++  applicabilityReason: string;
++  source: "scanner" | "manual" | "mixed" | "not_tested";
++  evidence: Array<{
++    source: "remedy" | "cxone-health";
++    ruleId: string;
++    findingId: string;
++    severity: "error" | "warning" | "info";
++    message: string;
++    selector?: string;
++    snippet?: string;
++    fixable: boolean;
++    exceptionId?: string;
++    fixBlockedReason?: string;
++    fixBlockedMessage?: string;
++    imageUrl?: string;
++    imageStatus?: number;
++    imageMimeType?: string;
++  }>;
++  updatedAt: string;
++};
++
++export type WcagReview = {
++  target: "DOJ Title II";
++  standard: "WCAG 2.1 Level A/AA";
++  wcagVersion: "2.1";
++  generatedAt: string;
++  scannedAt: string;
++  criteria: WcagCriterionResult[];
++  summary: {
++    score: number | null;
++    scorePassCount: number;
++    scoreFailCount: number;
++    scoreDenominator: number;
++    passCount: number;
++    failCount: number;
++    manualReviewCount: number;
++    notTestedCount: number;
++    exceptionCount: number;
++    verifiedExceptionCount: number;
++    notApplicableCount: number;
++    complete: boolean;
++  };
++};
++
++export type DojException = {
++  id: string;
++  type: string;
++  scope: "page" | "evidence";
++  status: "claimed" | "verified" | "rejected";
++  reason: string;
++  evidenceRefs: string[];
++  source: "scanner" | "manual" | "import";
++  updatedAt: string;
+ };

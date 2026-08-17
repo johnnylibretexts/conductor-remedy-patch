@@ -1,0 +1,638 @@
+From 4c7d21656e58ac9eeb31a886e365ed24be5ebd9a Mon Sep 17 00:00:00 2001
+From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
+Date: Sat, 15 Aug 2026 00:37:09 -0700
+Subject: [PATCH 2/3] feat(a11y): add Remedy scan/preview/apply endpoints and
+ bulk section updates
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the server-side wiring the accessibility matrix needs to talk to a Remedy
+Server instance, plus a bulk variant of the existing per-item update.
+
+New endpoints, all behind verifyRequest + getUserAttributes and gated on
+checkProjectMemberPermission:
+
+  GET  /project/accessibility/remedy/health
+  POST /project/accessibility/remedy/scan
+  POST /project/accessibility/remedy/preview
+  POST /project/accessibility/remedy/apply
+  PUT  /project/accessibility/sections/items
+
+The three Remedy routes proxy to /v1/cxone/page/{scan,preview-fix,apply-fix}.
+The base URL comes from REMEDY_API_BASE_URL (or PROJECT_REMEDY_BASE_URL) and
+defaults to http://127.0.0.1:8000; REMEDY_API_KEY, when set, is sent as
+X-API-Key. Backend errors are unwrapped from the FastAPI `detail` shape so the
+client sees the real reason rather than a generic failure.
+
+Two constraints worth calling out for review:
+
+- apply is refused unless the target page path contains a Sandboxes/ segment.
+  Fixes write back to CXone, so the guard keeps writes off live library pages
+  regardless of what the client sends.
+- scan persists the returned wcagReview/dojExceptions onto the matching
+  a11yReview subdocument, so a page's WCAG state survives a reload.
+
+updateA11YReviewSectionItems replaces N sequential round-trips with one
+bulkWrite when a reviewer toggles several cells at once; per-key validation is
+unchanged (validateA11YReviewSectionItem, boolean values only).
+
+importA11YSectionsFromTOC now uses the extracted TOC utils, so imported
+sections carry pageID and merges preserve state across a retitle.
+
+Also coerces a11yProgress to a number on update and validates it as a float in
+0..100 — it is stored as Number and a string body value silently wrote a
+string.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ server/api.js          |  48 +++++
+ server/api/projects.js | 460 +++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 471 insertions(+), 37 deletions(-)
+
+diff --git a/server/api.js b/server/api.js
+index a60e0613..249ac7c0 100644
+--- a/server/api.js
++++ b/server/api.js
+@@ -2295,6 +2295,54 @@ router
+     projectsAPI.updateA11YReviewSectionItem
+   );
+ 
++router
++  .route("/project/accessibility/sections/items")
++  .put(
++    authAPI.verifyRequest,
++    authAPI.getUserAttributes,
++    projectsAPI.validate("updateA11YReviewSectionItems"),
++    middleware.checkValidationErrors,
++    projectsAPI.updateA11YReviewSectionItems
++  );
++
++router
++  .route("/project/accessibility/remedy/scan")
++  .post(
++    authAPI.verifyRequest,
++    authAPI.getUserAttributes,
++    projectsAPI.validate("scanA11YWithRemedy"),
++    middleware.checkValidationErrors,
++    projectsAPI.scanA11YWithRemedy
++  );
++
++router
++  .route("/project/accessibility/remedy/health")
++  .get(
++    authAPI.verifyRequest,
++    authAPI.getUserAttributes,
++    projectsAPI.checkProjectRemedyHealth
++  );
++
++router
++  .route("/project/accessibility/remedy/preview")
++  .post(
++    authAPI.verifyRequest,
++    authAPI.getUserAttributes,
++    projectsAPI.validate("previewA11YWithRemedy"),
++    middleware.checkValidationErrors,
++    projectsAPI.previewA11YWithRemedy
++  );
++
++router
++  .route("/project/accessibility/remedy/apply")
++  .post(
++    authAPI.verifyRequest,
++    authAPI.getUserAttributes,
++    projectsAPI.validate("applyA11YWithRemedy"),
++    middleware.checkValidationErrors,
++    projectsAPI.applyA11YWithRemedy
++  );
++
+ router
+   .route("/project/:projectID/thumbnail")
+   .put(
+diff --git a/server/api/projects.js b/server/api/projects.js
+index 8d93f0f3..a9c43f9c 100644
+--- a/server/api/projects.js
++++ b/server/api/projects.js
+@@ -7,6 +7,7 @@
+ import BluebirdPromise from 'bluebird';
+ import express from 'express';
+ import { body, query, param } from 'express-validator';
++import axios from 'axios';
+ import {
+   S3Client,
+   PutObjectCommand,
+@@ -40,7 +41,11 @@ import {
+   isValidLicense,
+   getBookTOCFromAPI,
+ } from '../util/bookutils.js';
+-import { validateA11YReviewSectionItem } from '../util/a11yreviewutils.js';
++import {
++    buildA11YReviewSectionsFromTOC,
++    mergeA11YReviewSectionsFromTOC,
++    validateA11YReviewSectionItem,
++} from '../util/a11yreviewutils.js';
+ import { isEmptyString, assembleUrl, getPaginationOffset, extractEmailDomain } from '../util/helpers.js';
+ import authAPI from './auth.js';
+ import mailAPI from './mail.js';
+@@ -840,7 +845,7 @@ async function updateProject(req, res) {
+       updateObj.peerProgress = req.body.peerProgress;
+     }
+     if (req.body.hasOwnProperty('a11yProgress') && req.body.a11yProgress !== project.a11yProgress) {
+-      updateObj.a11yProgress = req.body.a11yProgress;
++      updateObj.a11yProgress = Number(req.body.a11yProgress);
+     }
+     if (req.body.status && req.body.status !== project.status) {
+       updateObj.status = req.body.status;
+@@ -2782,21 +2787,337 @@ const updateA11YReviewSectionItem = (req, res) => {
+ };
+ 
+ 
+-const importA11YSectionsFromTOC = async (req, res) => {
+-    const recurseBuildPagesArray = (pages) => {
+-        if (!Array.isArray(pages)) return [];
+-        let processed = [];
+-        pages.forEach((item) => {
+-            const children = item.children;
+-            delete item.children;
+-            processed.push(item);
+-            if (Array.isArray(children) && children.length > 0) {
+-                processed = [...processed, ...recurseBuildPagesArray(children)];
+-            }
++/**
++ * Updates multiple boolean items within A11Y Review Sections in one request.
++ * NOTE: This function should only be called AFTER the validation chain.
++ * VALIDATION: 'updateA11YReviewSectionItems'
++ * @param {Object} req - the express.js request object
++ * @param {Object} res - the express.js response object
++ */
++const updateA11YReviewSectionItems = async (req, res) => {
++    try {
++        const project = await Project.findOne({
++            projectID: req.body.projectID
++        }).lean();
++        if (!project) {
++            throw (new Error('notfound'));
++        }
++        if (!checkProjectMemberPermission(project, req.user)) {
++            throw (new Error('unauth'));
++        }
++
++        const operations = req.body.updates
++            .map((update) => {
++                const toSet = {};
++                Object.entries(update.items).forEach(([itemName, newResponse]) => {
++                    toSet[`a11yReview.$.${itemName}`] = newResponse;
++                });
++                if (Object.keys(toSet).length === 0) {
++                    return null;
++                }
++                return {
++                    updateOne: {
++                        filter: {
++                            projectID: project.projectID,
++                            'a11yReview._id': update.sectionID,
++                        },
++                        update: {
++                            $set: toSet,
++                        },
++                    },
++                };
++            })
++            .filter(Boolean);
++
++        if (operations.length === 0) {
++            return res.send({
++                err: false,
++                msg: 'No review section items to update.',
++                modifiedCount: 0,
++            });
++        }
++
++        const updateRes = await Project.bulkWrite(operations);
++        return res.send({
++            err: false,
++            msg: 'Successfully updated review section items.',
++            modifiedCount: updateRes.modifiedCount || 0,
++        });
++    } catch (err) {
++        var errMsg = conductorErrors.err6;
++        if (err.message === 'notfound') errMsg = conductorErrors.err11;
++        else if (err.message === 'unauth') errMsg = conductorErrors.err8;
++        return res.send({
++            err: true,
++            errMsg: errMsg
+         });
+-        return processed;
++    }
++};
++
++
++const getProjectRemedyBaseUrl = () => {
++    const raw = process.env.REMEDY_API_BASE_URL || process.env.PROJECT_REMEDY_BASE_URL || 'http://127.0.0.1:8000';
++    return raw.replace(/\/+$/, '');
++};
++
++
++const getProjectRemedyHeaders = () => {
++    const headers = {
++        'Content-Type': 'application/json',
+     };
++    const apiKey = process.env.REMEDY_API_KEY || process.env.PROJECT_REMEDY_API_KEY;
++    if (typeof (apiKey) === 'string' && apiKey.length > 0) {
++        headers['X-API-Key'] = apiKey;
++    }
++    return headers;
++};
++
++
++const getProjectRemedyErrorMessage = (err) => {
++    if (err?.response?.data?.detail) {
++        if (typeof (err.response.data.detail) === 'string') {
++            return err.response.data.detail;
++        }
++        if (typeof (err.response.data.detail) === 'object' && typeof (err.response.data.detail.message) === 'string') {
++            return err.response.data.detail.message;
++        }
++    }
++    if (typeof (err?.message) === 'string' && err.message.length > 0) {
++        return err.message;
++    }
++    return conductorErrors.err6;
++};
++
++
++const proxyProjectRemedyRequest = async (endpoint, body) => {
++    return axios.post(
++        `${getProjectRemedyBaseUrl()}${endpoint}`,
++        body,
++        {
++            headers: getProjectRemedyHeaders(),
++            validateStatus: () => true,
++        },
++    ).then((response) => {
++        if (response.status >= 200 && response.status < 300) {
++            return response.data;
++        }
++        const detail = response.data?.detail;
++        const err = new Error(
++            typeof (detail) === 'string'
++                ? detail
++                : (typeof (detail?.message) === 'string' ? detail.message : conductorErrors.err6),
++        );
++        err.backendStatus = response.status;
++        err.backendCode = detail?.error;
++        throw err;
++    });
++};
++
++
++function pagePathFromSectionUrl(rawUrl) {
++    if (!rawUrl || typeof rawUrl !== 'string') return '';
++    try {
++        const url = new URL(rawUrl);
++        return decodeURIComponent(url.pathname.replace(/^\/+/, ''));
++    } catch (_e) {
++        return rawUrl.replace(/^\/+/, '');
++    }
++}
++
++
++function isSandboxSectionUrl(rawUrl) {
++    const pagePath = pagePathFromSectionUrl(rawUrl);
++    return /(^|\/)Sandboxes(\/|$)/.test(pagePath);
++}
++
++const checkProjectRemedyHealth = async (_req, res) => {
++    try {
++        const response = await axios.get(`${getProjectRemedyBaseUrl()}/healthz`, {
++            headers: getProjectRemedyHeaders(),
++            validateStatus: () => true,
++        });
++        if (response.status >= 200 && response.status < 300) {
++            return res.send({ err: false, ok: true });
++        }
++        return res.send({
++            err: true,
++            errMsg: `Remedy Server health check failed (${response.status}).`,
++            status: response.status,
++        });
++    } catch (err) {
++        return res.send({
++            err: true,
++            errMsg: getProjectRemedyErrorMessage(err),
++        });
++    }
++};
++
++
++const scanA11YWithRemedy = async (req, res) => {
++    try {
++        const project = await Project.findOne({
++            projectID: req.body.projectID,
++        }).lean();
++        if (!project) {
++            throw (new Error('notfound'));
++        }
++        if (!checkProjectMemberPermission(project, req.user)) {
++            throw (new Error('unauth'));
++        }
++
++        const currentSection = Array.isArray(project.a11yReview)
++            ? project.a11yReview.find((section) => String(section._id) === String(req.body.sectionID))
++            : undefined;
++
++        const data = await proxyProjectRemedyRequest('/v1/cxone/page/scan', {
++            page_url: req.body.sectionURL,
++            page_id: req.body.pageID,
++            section_title: req.body.sectionTitle,
++            wcag_review: currentSection?.wcagReview,
++            doj_exceptions: Array.isArray(currentSection?.dojExceptions) ? currentSection.dojExceptions : [],
++        });
++
++        if (req.body.sectionID && (data.wcag_review || data.wcagReview || data.doj_exceptions || data.dojExceptions)) {
++            const wcagReview = data.wcag_review || data.wcagReview;
++            const dojExceptions = data.doj_exceptions || data.dojExceptions || [];
++            const toSet = {};
++            if (wcagReview) {
++                toSet['a11yReview.$.wcagReview'] = wcagReview;
++            }
++            if (Array.isArray(dojExceptions)) {
++                toSet['a11yReview.$.dojExceptions'] = dojExceptions;
++            }
++            if (Object.keys(toSet).length > 0) {
++                await Project.updateOne({
++                    projectID: project.projectID,
++                    'a11yReview._id': req.body.sectionID,
++                }, {
++                    $set: toSet,
++                });
++            }
++        }
++
++        return res.send({
++            err: false,
++            ...data,
++        });
++    } catch (err) {
++        let errMsg = conductorErrors.err6;
++        let error = undefined;
++        if (err.message === 'notfound') {
++            errMsg = conductorErrors.err11;
++        } else if (err.message === 'unauth') {
++            errMsg = conductorErrors.err8;
++        } else {
++            errMsg = getProjectRemedyErrorMessage(err);
++            error = err.backendCode;
++        }
++        return res.send({
++            err: true,
++            errMsg,
++            error,
++            status: err.backendStatus,
++        });
++    }
++};
++
++
++const previewA11YWithRemedy = async (req, res) => {
++    try {
++        const project = await Project.findOne({
++            projectID: req.body.projectID,
++        }).lean();
++        if (!project) {
++            throw (new Error('notfound'));
++        }
++        if (!checkProjectMemberPermission(project, req.user)) {
++            throw (new Error('unauth'));
++        }
++
++        const data = await proxyProjectRemedyRequest('/v1/cxone/page/preview-fix', {
++            page_url: req.body.sectionURL,
++            page_id: req.body.pageID,
++            finding_ids: req.body.findingIDs,
++            fix_mode: req.body.fixMode,
++            tier: req.body.tier,
++        });
++
++        return res.send({
++            err: false,
++            ...data,
++        });
++    } catch (err) {
++        let errMsg = conductorErrors.err6;
++        let error = undefined;
++        if (err.message === 'notfound') {
++            errMsg = conductorErrors.err11;
++        } else if (err.message === 'unauth') {
++            errMsg = conductorErrors.err8;
++        } else {
++            errMsg = getProjectRemedyErrorMessage(err);
++            error = err.backendCode;
++        }
++        return res.send({
++            err: true,
++            errMsg,
++            error,
++        });
++    }
++};
++
+ 
++const applyA11YWithRemedy = async (req, res) => {
++    try {
++        const project = await Project.findOne({
++            projectID: req.body.projectID,
++        }).lean();
++        if (!project) {
++            throw (new Error('notfound'));
++        }
++        if (!checkProjectMemberPermission(project, req.user)) {
++            throw (new Error('unauth'));
++        }
++        if (req.body.sectionURL && !isSandboxSectionUrl(req.body.sectionURL)) {
++            throw (new Error('nonsandbox'));
++        }
++
++        const data = await proxyProjectRemedyRequest('/v1/cxone/page/apply-fix', {
++            page_url: req.body.sectionURL,
++            page_id: req.body.pageID,
++            finding_ids: req.body.findingIDs,
++            preview_hash: req.body.previewHash,
++            preview_token: req.body.previewToken,
++            fix_mode: req.body.fixMode,
++            tier: req.body.tier,
++        });
++
++        return res.send({
++            err: false,
++            ...data,
++        });
++    } catch (err) {
++        let errMsg = conductorErrors.err6;
++        let error = undefined;
++        if (err.message === 'notfound') {
++            errMsg = conductorErrors.err11;
++        } else if (err.message === 'unauth') {
++            errMsg = conductorErrors.err8;
++        } else if (err.message === 'nonsandbox') {
++            errMsg = 'Remedy apply is limited to Sandboxes/ pages.';
++        } else {
++            errMsg = getProjectRemedyErrorMessage(err);
++            error = err.backendCode;
++        }
++        return res.send({
++            err: true,
++            errMsg,
++            error,
++        });
++    }
++};
++
++
++const importA11YSectionsFromTOC = async (req, res) => {
+     try {
+         const projectData = await Project.findOne({
+             projectID: req.body.projectID
+@@ -2814,33 +3135,14 @@ const importA11YSectionsFromTOC = async (req, res) => {
+         const toc = await getBookTOCFromAPI(bookID, projectData.projectURL);
+         if (!toc) throw new Error('notoc'); // handle as generic error below
+ 
+-        const pages = recurseBuildPagesArray(toc.children);
+-        let pageObjs = pages.map((page) => ({
+-            sectionTitle: page.title,
+-            sectionURL: page.url
+-        }));
++        // Sections carry the CXone pageID so downstream scans can address a page
++        // by id rather than by URL.
++        let pageObjs = buildA11YReviewSectionsFromTOC(toc);
+ 
+         let resMsg = 'No pages found to import.';
+         if (pageObjs.length > 0) {
+             if (req.body.merge === true && Array.isArray(projectData.a11yReview)) {
+-                const currentState = projectData.a11yReview;
+-                pageObjs = pageObjs.map((page) => {
+-                    let foundIndex = -1;
+-                    const foundExisting = projectData.a11yReview.find((existing, index) => {
+-                        if (existing.sectionTitle === page.sectionTitle) {
+-                            foundIndex = index;
+-                            return existing;
+-                        }
+-                        return null;
+-                    });
+-                    if (foundExisting !== undefined) {
+-                        if (foundIndex !== -1) {
+-                            currentState.splice(foundIndex, 1);
+-                        }
+-                        return foundExisting;
+-                    }
+-                    return page;
+-                });
++                pageObjs = mergeA11YReviewSectionsFromTOC(pageObjs, projectData.a11yReview);
+             }
+ 
+             const updateRes = await Project.updateOne({
+@@ -3868,6 +4170,7 @@ const validate = (method) => {
+           body('projectID', conductorErrors.err1).exists().isString().isLength({ min: 10, max: 10 }),
+           body('title', conductorErrors.err1).optional().isString().isLength({ min: 1 }),
+           body('tags', conductorErrors.err1).optional({ checkFalsy: true }).isArray(),
++          body('a11yProgress', conductorErrors.err1).optional().isFloat({ min: 0, max: 100 }).toFloat(),
+           body('status', conductorErrors.err1).optional({ checkFalsy: true }).isString().custom(validateProjectStatus),
+           body('classification', conductorErrors.err1).optional({ checkFalsy: true }).custom(validateProjectClassification),
+           body('visibility', conductorErrors.err1).optional({ checkFalsy: true }).custom(validateVisibility),
+@@ -3961,6 +4264,84 @@ const validate = (method) => {
+           body('itemName', conductorErrors.err1).exists().isString().custom(validateA11YReviewSectionItem),
+           body('newResponse', conductorErrors.err1).exists().isBoolean().toBoolean()
+       ]
++    case 'updateA11YReviewSectionItems':
++      return [
++          body('projectID', conductorErrors.err1).exists().isString().isLength({ min: 10, max: 10 }),
++          body('updates', conductorErrors.err1).exists().isArray({ min: 1 }),
++          body('updates.*.sectionID', conductorErrors.err1).exists().isMongoId(),
++          body('updates.*.items', conductorErrors.err1).exists().isObject().custom((items) => {
++              const entries = Object.entries(items);
++              if (entries.length === 0) {
++                  throw (new Error('items'));
++              }
++              entries.forEach(([itemName, newResponse]) => {
++                  if (!validateA11YReviewSectionItem(itemName) || typeof (newResponse) !== 'boolean') {
++                      throw (new Error('items'));
++                  }
++              });
++              return true;
++          }),
++      ]
++    case 'scanA11YWithRemedy':
++      return [
++          body('projectID', conductorErrors.err1).exists().isString().isLength({ min: 10, max: 10 }),
++          body('sectionURL', conductorErrors.err1).optional({ checkFalsy: true }).isString(),
++          body('sectionTitle', conductorErrors.err1).optional({ checkFalsy: true }).isString(),
++          body('sectionID', conductorErrors.err1).optional({ checkFalsy: true }).isMongoId(),
++          body('pageID', conductorErrors.err1).optional({ checkFalsy: true }).custom((value) => {
++              if (typeof (value) === 'number') return true;
++              if (typeof (value) === 'string' && value.length > 0) return true;
++              throw (new Error('page'));
++          }),
++          body().custom((_value, { req }) => {
++              if (!req.body.sectionURL && !req.body.pageID) {
++                  throw (new Error('page'));
++              }
++              return true;
++          }),
++      ]
++    case 'previewA11YWithRemedy':
++      return [
++          body('projectID', conductorErrors.err1).exists().isString().isLength({ min: 10, max: 10 }),
++          body('sectionURL', conductorErrors.err1).optional({ checkFalsy: true }).isString(),
++          body('pageID', conductorErrors.err1).optional({ checkFalsy: true }).custom((value) => {
++              if (typeof (value) === 'number') return true;
++              if (typeof (value) === 'string' && value.length > 0) return true;
++              throw (new Error('page'));
++          }),
++          body('findingIDs', conductorErrors.err1).exists().isArray({ min: 1 }),
++          body('findingIDs.*', conductorErrors.err1).exists().isString(),
++          body('fixMode', conductorErrors.err1).optional({ checkFalsy: true }).isIn(['deterministic', 'pipeline']),
++          body('tier', conductorErrors.err1).optional({ checkFalsy: true }).isInt({ min: 1, max: 3 }),
++          body().custom((_value, { req }) => {
++              if (!req.body.sectionURL && !req.body.pageID) {
++                  throw (new Error('page'));
++              }
++              return true;
++          }),
++      ]
++    case 'applyA11YWithRemedy':
++      return [
++          body('projectID', conductorErrors.err1).exists().isString().isLength({ min: 10, max: 10 }),
++          body('sectionURL', conductorErrors.err1).optional({ checkFalsy: true }).isString(),
++          body('pageID', conductorErrors.err1).optional({ checkFalsy: true }).custom((value) => {
++              if (typeof (value) === 'number') return true;
++              if (typeof (value) === 'string' && value.length > 0) return true;
++              throw (new Error('page'));
++          }),
++          body('findingIDs', conductorErrors.err1).exists().isArray({ min: 1 }),
++          body('findingIDs.*', conductorErrors.err1).exists().isString(),
++          body('previewHash', conductorErrors.err1).exists().isString().isLength({ min: 8 }),
++          body('previewToken', conductorErrors.err1).optional({ checkFalsy: true }).isString().isLength({ min: 8 }),
++          body('fixMode', conductorErrors.err1).optional({ checkFalsy: true }).isIn(['deterministic', 'pipeline']),
++          body('tier', conductorErrors.err1).optional({ checkFalsy: true }).isInt({ min: 1, max: 3 }),
++          body().custom((_value, { req }) => {
++              if (!req.body.sectionURL && !req.body.pageID) {
++                  throw (new Error('page'));
++              }
++              return true;
++          }),
++      ]
+     case 'requestProjectPublishing':
+       return [
+           body('projectID', conductorErrors.err1).exists().isString().isLength({ min: 10, max: 10 }),
+@@ -4058,6 +4439,11 @@ export default {
+     createA11YReviewSection,
+     getA11YReviewSections,
+     updateA11YReviewSectionItem,
++    updateA11YReviewSectionItems,
++    scanA11YWithRemedy,
++    checkProjectRemedyHealth,
++    previewA11YWithRemedy,
++    applyA11YWithRemedy,
+     importA11YSectionsFromTOC,
+     autoGenerateProjects,
+     getProjectBookReaderResources,
