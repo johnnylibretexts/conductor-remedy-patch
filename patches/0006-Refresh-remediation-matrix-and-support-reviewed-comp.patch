@@ -1,0 +1,306 @@
+From 71faa112a66f620048bd8fef5c5148b1282da403 Mon Sep 17 00:00:00 2001
+From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 20:07:06 -0700
+Subject: [PATCH 06/12] Refresh remediation matrix and support reviewed
+ complex-image descriptions
+
+(cherry picked from commit 473904889b40a410b2622b3bcf5dec93b7f98ce8)
+---
+ .../projects/ProjectAccessibility.jsx         |  2 +-
+ .../projects/RemediationPageActions.test.ts   | 27 ++++++++++++
+ .../projects/RemediationPageActions.tsx       | 43 ++++++++++++-------
+ .../projects/RemediationWorkQueue.tsx         |  4 +-
+ docs/remediation-integration.md               | 31 +++++++++----
+ server/api/remediationactions.ts              |  4 +-
+ server/util/remediationactions.test.ts        | 14 ++++++
+ 7 files changed, 97 insertions(+), 28 deletions(-)
+ create mode 100644 client/src/components/projects/RemediationPageActions.test.ts
+
+diff --git a/client/src/components/projects/ProjectAccessibility.jsx b/client/src/components/projects/ProjectAccessibility.jsx
+index 6dd41339..dc3e0169 100644
+--- a/client/src/components/projects/ProjectAccessibility.jsx
++++ b/client/src/components/projects/ProjectAccessibility.jsx
+@@ -1558,7 +1558,7 @@ const ProjectAccessibility = (props) => {
+                                                     }
+                                                 </div>
+                                             </Segment>
+-                                            <RemediationWorkQueue projectID={props.match.params.id} />
++                                            <RemediationWorkQueue projectID={props.match.params.id} onScanSaved={() => getReviewSections({ persistScore: true })} />
+                                             <WcagReviewTable
+                                                 sections={reviewSections}
+                                                 getSectionFixableIssueCount={getSectionFixableIssueCount}
+diff --git a/client/src/components/projects/RemediationPageActions.test.ts b/client/src/components/projects/RemediationPageActions.test.ts
+new file mode 100644
+index 00000000..ec3e9b3f
+--- /dev/null
++++ b/client/src/components/projects/RemediationPageActions.test.ts
+@@ -0,0 +1,27 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import React, { act } from 'react';
++import { createRoot } from 'react-dom/client';
++import { JSDOM } from 'jsdom';
++import RemediationPageActions from './RemediationPageActions';
++
++for (const scenario of [{item:false,error:false},{item:true,error:false},{item:false,error:true}]) {
++  test(`scan updates matrix only after persistence and reports task evidence accurately: ${JSON.stringify(scenario)}`, async () => {
++    const dom = new JSDOM('<div id="root"></div>', { url: 'https://example.test' });
++    const oldWindow=globalThis.window, oldDocument=globalThis.document;
++    Object.assign(globalThis,{window:dom.window,document:dom.window.document,IS_REACT_ACT_ENVIRONMENT:true});
++    const root=createRoot(document.getElementById('root')!);let saved=0;
++    try {
++      await act(async()=>root.render(React.createElement(RemediationPageActions,{
++        base:'/test',section:{id:'page',title:'Page'},item:scenario.item ? {_id:'task',title:'Image'}:undefined,
++        request:async()=>({findings:[],scanned_at:'2026-09-13',scanError:scenario.error ? 'Matrix save failed':undefined}),
++        refreshed:async()=>{},onScanSaved:()=>saved++,close:()=>{},
++      })));
++      await act(async()=>Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Rescan page')!.click());
++      assert.equal(saved,scenario.error ? 0:1);
++      assert.equal(document.body.textContent?.includes('Evidence attached to the task'),scenario.item && !scenario.error);
++      assert.equal(document.body.textContent?.includes('Matrix save failed'),scenario.error);
++      assert.equal(document.body.textContent?.includes('Reload matrix from saved scan'),false);
++    } finally {await act(async()=>root.unmount());Object.assign(globalThis,{window:oldWindow,document:oldDocument});dom.window.close();}
++  });
++}
+diff --git a/client/src/components/projects/RemediationPageActions.tsx b/client/src/components/projects/RemediationPageActions.tsx
+index 9a523b3a..447046bc 100644
+--- a/client/src/components/projects/RemediationPageActions.tsx
++++ b/client/src/components/projects/RemediationPageActions.tsx
+@@ -1,6 +1,6 @@
+ import React, { useState } from 'react';
+ 
+-export default function RemediationPageActions({ base, section, item, request, refreshed, close }: any) {
++export default function RemediationPageActions({ base, section, item, request, refreshed, onScanSaved, close }: any) {
+   const [scan, setScan] = useState<any>(null);
+   const [selected, setSelected] = useState<string[]>([]);
+   const [mode, setMode] = useState('deterministic');
+@@ -12,35 +12,47 @@ export default function RemediationPageActions({ base, section, item, request, r
+   const [message, setMessage] = useState('');
+   const [reviewed, setReviewed] = useState(false);
+   const [altEdits, setAltEdits] = useState<Record<string, string>>({});
++  const [longEdits, setLongEdits] = useState<Record<string, string>>({});
+   const [lastSnapshot, setLastSnapshot] = useState('');
+-  const invalidate = () => { setPreview(null); setReviewed(false); setAltEdits({}); };
++  const invalidate = () => { setPreview(null); setReviewed(false); setAltEdits({}); setLongEdits({}); };
+   const call = (action: string, body: any = {}) => request(`${base}/page/${encodeURIComponent(section.id)}/${action}`, 'POST', { ...body, itemID: item?._id });
+   const selectFindings = (result: any) => {
+     setScan(result);
+     const matches = (result.findings || []).filter((f: any) => f.fixable && item && f.ruleId === item.ruleId && (!item.selector || f.selector === item.selector));
+     setSelected(matches.map((f: any) => f.id));
+   };
+-  async function act(action: string) {
++  async function act(action: string, imageSource?: string) {
+     setBusy(true); setError(''); setMessage('');
+     try {
+       if (action === 'scan') {
+         invalidate(); const result = await call('scan'); selectFindings(result);
+-        setMessage(result.scanError || result.evidenceError || 'Rescan complete. Evidence attached to the task; reviewer verification is still required.');
++        if (!result.scanError) onScanSaved?.();
++        setMessage(result.scanError || result.evidenceError || (item ? 'Rescan complete. Evidence attached to the task; reviewer verification is still required.' : 'Rescan complete. Matrix updated; reviewer verification is still required.'));
+       } else if (action === 'snapshots') {
+         invalidate(); const result = await call('snapshots'); setSnapshots(result.snapshots || []); setSnapshot('');
+         setMessage(result.snapshots?.length ? 'Choose a saved version and preview the restoration.' : 'No saved versions for this page.');
++      } else if (action === 'describe-image') {
++        const result = await call('describe-image', { imageSource, previewToken: preview.preview_token });
++        setAltEdits(prev => ({ ...prev, [imageSource!]: result.suggestion.alt }));
++        setLongEdits(prev => ({ ...prev, [imageSource!]: result.suggestion.description }));
++        setReviewed(false); setMessage('Description generated. Check every value and relationship against the source image, then update the reviewed description.');
++      } else if (action === 'image-review') {
++        invalidate(); setMode('deterministic');
++        const result = await call('preview', { reviewImages: true });
++        setPreview({ ...result, kind: 'apply' });
++        setMessage(result.review_images?.length ? 'Review image descriptions and add detailed text where needed.' : 'No uniquely identified images are available for this review.');
+       } else if (action === 'revise-preview') {
+-        const result = await call('revise-preview', { previewToken: preview.preview_token, altEdits: Object.entries(altEdits).map(([src, text]) => ({ src, text })) });
+-        setReviewed(false); setAltEdits({}); setPreview({ ...result, kind: 'apply' });
++        const result = await call('revise-preview', { previewToken: preview.preview_token, altEdits: Array.from(new Set([...Object.keys(altEdits), ...Object.keys(longEdits)])).map(src => ({ src, text: altEdits[src] ?? images.find(i => i.source === src)?.after ?? '', ...(longEdits[src] !== undefined ? { longDescription: longEdits[src] } : {}) })) });
++        setReviewed(false); setAltEdits({}); setLongEdits({}); setPreview({ ...result, kind: 'apply' });
+         setMessage('Description updated. Review the revised preview before applying.');
+       } else if (action === 'preview' || action === 'restore-preview') {
+         invalidate(); const result = await call(action, { findingIDs: selected, fixMode: mode === 'deterministic' ? mode : 'pipeline', tier: mode === 'advanced' ? 3 : 2, snapshotTimestamp: snapshot });
+-        setAltEdits({}); setPreview({ ...result, kind: action === 'preview' ? 'apply' : 'restore' });
++        setAltEdits({}); setLongEdits({}); setPreview({ ...result, kind: action === 'preview' ? 'apply' : 'restore' });
+       } else {
+         const result = await call(action, { findingIDs: selected, fixMode: mode === 'deterministic' ? mode : 'pipeline', previewHash: preview.preview_hash, previewToken: preview.preview_token });
+-        invalidate(); if (result.scan) selectFindings(result.scan);
++        invalidate(); if (result.scan) { selectFindings(result.scan); if (!result.scanError) onScanSaved?.(); }
+         if (result.snapshot_path) setLastSnapshot(result.snapshot_path.split('/').pop());
+-        setMessage(`${action === 'apply' ? 'Apply' : 'Restore'} completed. ${result.scanError || result.evidenceError || 'Rescan complete; evidence attached. Final verification remains with the reviewer.'}`);
++        setMessage(`${action === 'apply' ? 'Apply' : 'Restore'} completed. ${result.scanError || result.evidenceError || (item ? 'Rescan complete; evidence attached. Final verification remains with the reviewer.' : 'Rescan complete. Matrix updated. Final verification remains with the reviewer.')}`);
+       }
+       await refreshed();
+     } catch (e: any) { setError(e.message); if (action === 'apply' || action === 'restore') invalidate(); }
+@@ -50,13 +62,13 @@ export default function RemediationPageActions({ base, section, item, request, r
+   if (preview?.before_html && preview.kind === 'apply') {
+     const before = new DOMParser().parseFromString(preview.before_html, 'text/html');
+     const after = new DOMParser().parseFromString(preview.after_html, 'text/html');
+-    for (const finding of (scan?.findings || []).filter((f: any) => selected.includes(f.id))) {
++    for (const finding of (preview.review_images || scan?.findings || []).filter((f: any) => preview.review_images || selected.includes(f.id))) {
+       try {
+         const findImage = (doc: Document) => finding.data?.src ? Array.from(doc.querySelectorAll('img')).find(img => img.getAttribute('src') === finding.data.src) : doc.querySelector(finding.selector);
+         const original = findImage(before), changed = findImage(after);
+         if (original?.tagName !== 'IMG' || !changed) continue;
+         const src = new URL(original.getAttribute('src') || '', scan.page_url).href;
+-        if (src.startsWith('https:')) images.push({ src, source: original.getAttribute('src'), before: original.getAttribute('alt'), after: changed.getAttribute('alt') });
++        if (src.startsWith('https:')) images.push({ src, source: original.getAttribute('src'), before: original.getAttribute('alt'), after: changed.getAttribute('alt'), longDescription: (changed.getAttribute('aria-describedby') || '').split(/\s+/).map((id: string) => after.getElementById(id)).find((el: HTMLElement | null) => el?.hasAttribute('data-remedy-image-description'))?.textContent || '' });
+       } catch { /* Full HTML remains available if a scanner selector cannot be resolved. */ }
+     }
+   }
+@@ -66,11 +78,12 @@ export default function RemediationPageActions({ base, section, item, request, r
+     <p>Preview changes, review the result, then apply. Apply and restore both rescan the page. Restore replaces the full page body with the selected saved version.</p>
+     {error && <div role="alert" className="ui negative message">{error}</div>}
+     <div role="status">{busy ? 'Working…' : message}</div>
+-    {message && <p><button type="button" className="ui button" disabled={busy} onClick={() => window.location.reload()}>Reload matrix from saved scan</button></p>}
++    {message && !onScanSaved && <p><button type="button" className="ui button" disabled={busy} onClick={() => window.location.reload()}>Reload matrix from saved scan</button></p>}
+     {lastSnapshot && <p>Recovery snapshot saved: <code>{lastSnapshot}</code></p>}
+     <div className="rq-fields">
+       <button type="button" className="ui button" disabled={busy} onClick={() => act('scan')}>Rescan page</button>
+       <button type="button" className="ui button" disabled={busy} onClick={() => act('snapshots')}>Restore saved version</button>
++      <button type="button" className="ui button" disabled={busy || !scan} onClick={() => act('image-review')}>Review all image descriptions</button>
+       <button type="button" className="ui button" disabled={busy} onClick={close}>Close page actions</button>
+     </div>
+     {scan && <>
+@@ -85,13 +98,13 @@ export default function RemediationPageActions({ base, section, item, request, r
+     {!!snapshots.length && <div className="ui segment"><label>Saved version<select disabled={busy} value={snapshot} onChange={e => { setSnapshot(e.target.value); invalidate(); }}><option value="">Choose a saved version</option>{snapshots.map(s => <option key={s.timestamp} value={s.timestamp}>{s.timestamp} — {s.summary} — {s.hash}</option>)}</select></label><button className="ui button" disabled={busy || !snapshot} onClick={() => act('restore-preview')}>Preview restore</button></div>}
+     {preview && <div className="ui segment">
+       <h4>{preview.kind === 'restore' ? 'Restore preview' : 'Fix preview'}</h4>
+-      {images.map((i, n) => <figure key={n}><img src={i.src} alt="Source image being reviewed for its proposed description" style={{ maxWidth: '100%', maxHeight: 360 }} /><figcaption><p>Current alt text: {i.before || '(empty)'}</p><p><strong>Proposed alt text:</strong> {i.after || '(empty)'}</p></figcaption>{mode === 'deterministic' && <label>Edit proposed alt text<textarea maxLength={150} value={altEdits[i.source] ?? i.after ?? ''} disabled={busy} onChange={e => { setAltEdits(prev => ({ ...prev, [i.source]: e.target.value })); setReviewed(false); }} /></label>}</figure>)}
+-      {!!Object.keys(altEdits).length && <button className="ui button" disabled={busy} onClick={() => act('revise-preview')}>Update reviewed description</button>}
++      {images.map((i, n) => <figure key={n}><img src={i.src} alt="Source image being reviewed for its proposed description" style={{ maxWidth: '100%', maxHeight: 360 }} /><figcaption><p>Current alt text: {i.before || '(empty)'}</p><p><strong>Proposed alt text:</strong> {i.after || '(empty)'}</p></figcaption>{mode === 'deterministic' && <label>Edit proposed alt text<textarea maxLength={150} value={altEdits[i.source] ?? i.after ?? ''} disabled={busy} onChange={e => { setAltEdits(prev => ({ ...prev, [i.source]: e.target.value })); setReviewed(false); }} /></label>}{mode === 'deterministic' && <button type="button" className="ui button" disabled={busy || !!Object.keys(altEdits).length || !!Object.keys(longEdits).length} onClick={() => act('describe-image', i.source)}>Generate detailed image description</button>}{mode === 'deterministic' && <label>Long description (optional)<textarea maxLength={12000} rows={6} value={longEdits[i.source] ?? i.longDescription} disabled={busy} onChange={e => { setLongEdits(prev => ({ ...prev, [i.source]: e.target.value })); setReviewed(false); }} /><span>Visible text linked to this image. Include all relevant table values, chart trends, or diagram relationships. Plain text only; review for accuracy.</span></label>}</figure>)}
++      {!!(Object.keys(altEdits).length + Object.keys(longEdits).length) && <button className="ui button" disabled={busy} onClick={() => act('revise-preview')}>Update reviewed description</button>}
+       {preview.diff && <pre className="rq-evidence" style={{ maxHeight: 360 }}>{preview.diff}</pre>}
+       <details><summary>Compare full page HTML</summary><h5>Current HTML</h5><pre className="rq-evidence">{preview.before_html}</pre><h5>Proposed HTML</h5><pre className="rq-evidence">{preview.after_html}</pre></details>
+       {(preview.fix_errors || []).length > 0 && <p>Some fixes failed: {JSON.stringify(preview.fix_errors)}</p>}
+       <label><input type="checkbox" checked={reviewed} disabled={busy} onChange={e => setReviewed(e.target.checked)} /> I reviewed this preview and want to {preview.kind === 'restore' ? 'restore this saved version' : 'apply these changes'}.</label>
+-      <button className="ui primary button" disabled={busy || !!Object.keys(altEdits).length || !reviewed || preview.before_html === preview.after_html} onClick={() => act(preview.kind)}>{preview.kind === 'restore' ? 'Confirm restore and rescan' : 'Apply reviewed fix and rescan'}</button>
++      <button className="ui primary button" disabled={busy || !!(Object.keys(altEdits).length + Object.keys(longEdits).length) || !reviewed || preview.before_html === preview.after_html} onClick={() => act(preview.kind)}>{preview.kind === 'restore' ? 'Confirm restore and rescan' : 'Apply reviewed fix and rescan'}</button>
+     </div>}
+   </section>;
+ }
+diff --git a/client/src/components/projects/RemediationWorkQueue.tsx b/client/src/components/projects/RemediationWorkQueue.tsx
+index ee025847..4f4dfecd 100644
+--- a/client/src/components/projects/RemediationWorkQueue.tsx
++++ b/client/src/components/projects/RemediationWorkQueue.tsx
+@@ -31,7 +31,7 @@ function EditItem({ item, users, save, busy }: any) {
+   </form>;
+ }
+ 
+-export default function RemediationWorkQueue({ projectID }: { projectID: string }) {
++export default function RemediationWorkQueue({ projectID, onScanSaved }: { projectID: string; onScanSaved?: () => void }) {
+   const [data, setData] = useState<any>({ items: [], users: [], sections: [], candidates: [] });
+   const [sectionID, setSectionID] = useState('');
+   const [chosen, setChosen] = useState<string[]>([]);
+@@ -69,7 +69,7 @@ export default function RemediationWorkQueue({ projectID }: { projectID: string
+     {error && <div role="alert" className="ui negative message">{error}</div>}
+     <div role="status" aria-live="polite">{message}</div>
+     {data.canEdit && <><label>Page tools<select value={activePage?.section.id || ''} onChange={e => { const section = data.sections.find((s: any) => s.id === e.target.value); setActivePage(section ? { section } : null); }}><option value="">Choose a page to fix or restore</option>{data.sections.map((s: any) => <option key={s.id} value={s.id}>{s.title}</option>)}</select></label></>}
+-    {activePage && data.canEdit && <RemediationPageActions key={`${activePage.section.id}-${activePage.item?._id || ''}`} {...activePage} base={base} request={request} refreshed={load} close={() => setActivePage(null)} />}
++    {activePage && data.canEdit && <RemediationPageActions key={`${activePage.section.id}-${activePage.item?._id || ''}`} {...activePage} base={base} request={request} refreshed={load} onScanSaved={onScanSaved} close={() => setActivePage(null)} />}
+     {data.canEdit && <details><summary>Add work from a page review</summary>
+       <label>Page<select value={sectionID} disabled={busy} onChange={e => setSectionID(e.target.value)}><option value="">Choose a page</option>{data.sections.map((s: any) => <option key={s.id} value={s.id}>{s.title}</option>)}</select></label>
+       {sectionID && <><p>Choose findings or manual checks. Existing items are retained; adding again does not duplicate them.</p>
+diff --git a/docs/remediation-integration.md b/docs/remediation-integration.md
+index 72af803b..3d26bb78 100644
+--- a/docs/remediation-integration.md
++++ b/docs/remediation-integration.md
+@@ -12,7 +12,7 @@ Conductor authenticates the instructor and checks project edit permission before
+ 
+ The queue is mounted on the project accessibility page. A task opens its source page; a fresh scan selects the finding by rule and selector. The reviewer generates a preview, inspects the image and diff, optionally edits proposed alt text, acknowledges the reviewed preview, and applies it. Apply rescans the source and attaches evidence to the originating task. Restore lists saved versions, requires a separate preview and acknowledgement, then restores and rescans.
+ 
+-Conductor routes use `/project/:projectID/accessibility/workqueue`. Page actions use `/page/:sectionID/:action` beneath that base: `scan`, `preview`, `revise-preview`, `apply`, `snapshots`, `restore-preview`, and `restore`. Browser-supplied source page IDs, URLs, snapshot paths, and scan evidence are not authoritative.
++Conductor routes use `/project/:projectID/accessibility/workqueue`. Page actions use `/page/:sectionID/:action` beneath that base: `scan`, `preview`, `describe-image`, `revise-preview`, `apply`, `snapshots`, `restore-preview`, and `restore`. Browser-supplied source page IDs, URLs, snapshot paths, and scan evidence are not authoritative.
+ 
+ Queue records persist in MongoDB with a unique project/finding key, optimistic version checks, assignment, priority, history, and scan evidence. Verification requires a reviewer note. Neither apply, scan, nor restore automatically verifies a task.
+ 
+@@ -28,8 +28,8 @@ Apply and restore validate the live content hash. Restore binds its expiring tok
+ 
+ ## Validation
+ 
+-- Remedy core: `npm run test --workspace @libretexts/remedy-core -- --run` — 155 tests passed.
+-- Conductor, from `server`: `./node_modules/.bin/tsx --test util/remediationactions.test.ts util/remediationqueue.test.ts util/corsPolicy.test.ts util/a11yreviewutils.test.ts` — 15 tests passed.
++- Remedy core: `npm run test --workspace @libretexts/remedy-core -- --run` — 168 tests passed.
++- Conductor, from `server`: `./node_modules/.bin/tsx --test util/remediationactions.test.ts util/remediationqueue.test.ts util/corsPolicy.test.ts util/a11yreviewutils.test.ts` — 16 server tests passed; 3 client persistence/wording tests also passed.
+ - Gateway: `python3 -m pytest tests/unit/test_cxone_recovery_routes.py -q` — 2 tests passed.
+ - Focused TypeScript checks cover the new client/server modules and bridge core.
+ 
+@@ -37,11 +37,8 @@ Browser acceptance on 2026-09-13 covered task creation, source-image inference,
+ 
+ ## Known limitations
+ 
+-- The deployed legacy matrix requires its reload control to display newly saved scan results; the task panel and evidence update immediately.
+-- Page tools currently uses scan-success wording that claims task evidence was attached even when no task was selected.
+-- A short alt summary does not expose every value in an image of a data table. Such images still need an accessible table or longer description and human review, even if the automatic alt check passes.
++- A short alt summary does not expose every value in an image of a data table. Use Review all image descriptions to add a visible, associated long description, including for images that already pass the short-alt check. Human review remains necessary.
+ - Model output requires subject-matter review. Automated checks are not accessibility certification.
+-- The full legacy application build and every page-wide agent strategy are outside this scoped acceptance run.
+ 
+ ## Deployment notes
+ 
+@@ -51,4 +48,22 @@ The isolated `client/src/remediation-queue-entry.tsx` supports layering the same
+ 
+ Matching component commits are Remedy Bridge `5d015f6981bc8ce125633c98af78e90ffffb9286` and Remedy Gateway `5893489cd84cdd38f1af59e7fed87c3a51d729d2`, published on `main` in their respective `johnnylibretexts` repositories. Use a fresh clone of the gateway repository when integrating this release; older checkouts have a different commit lineage.
+ 
+-At publication on 2026-09-13, GitHub reported 33 dependency alerts for Remedy Bridge (3 critical, 11 high, 17 moderate, 2 low). These alerts were not triaged in the remediation acceptance run. Review the repository's dependency-security report before production promotion.
++The follow-up Bridge dependency refresh addresses the 33 reported alerts. Full npm audit reports zero vulnerabilities; see the bridge repository's `docs/dependency-security.md` for resolved versions and validation.
++
++## Image descriptions and matrix updates
++
++A persisted scan triggers the parent matrix refresh after scan, apply, or restore. A task receives scan evidence only when a task was selected. Successful page writes and failed scan/evidence persistence remain separate outcomes.
++
++`preview` with `reviewImages: true` creates an unchanged, expiring preview for all uniquely identified source images. `describe-image` takes `imageSource` and `previewToken`, resolves the authorized page, and generates a suggestion from the actual image. It does not modify the source or the cached preview. The instructor edits the suggested short alt and long description, updates the preview, reviews it, and explicitly applies it.
++
++`revise-preview` accepts `altEdits` entries with `src`, `text`, and optional `longDescription`. Long descriptions are escaped plain text, limited to 12,000 characters, displayed beside the image and associated with `aria-describedby`. Existing associations and unrelated page bytes are preserved. Updating or removing a description affects only the generated block. Pending edits disable Apply until incorporated into the reviewed preview.
++
++## Expanded validation
++
++The complete Conductor client and server builds passed locally and in the Linux Docker build. Browser validation on the normal source-built application confirmed authenticated startup, page actions, automatic matrix refresh, correct no-task wording, actual-image description generation, reviewed editing, apply/rescan, and persistence of the long description after a fresh CXone read.
++
++Live advanced-agent tests exercised both Ollama primary and OpenAI fallback. Each corrected duplicate IDs and skipped heading levels, reducing the fixture from two findings to zero. The heading tool accepts exactly one existing heading and levels 1–6, preserving attributes and content. Additional cases covered tables, links, and already-correct content. Strategy-only Local Lab output can retain findings; it is not equivalent to the full deterministic-plus-agent pipeline.
++
++Axe incomplete checks retain informational severity and map to manual review, even when the rule's potential impact is critical. They are not reported as confirmed accessibility failures.
++
++Transparent source images are composited onto white for inference so black chemical labels remain visible. The source image is never changed. Table-header inference requires an explicitly marked header row; ordinary first-row data is left for reviewer-supplied headers. Table associations support grouped columns and row spans and allocate IDs across the whole page.
+diff --git a/server/api/remediationactions.ts b/server/api/remediationactions.ts
+index b12af261..f76352b6 100644
+--- a/server/api/remediationactions.ts
++++ b/server/api/remediationactions.ts
+@@ -4,7 +4,7 @@ export function registerRemediationActions(router: any, { base, access, Project,
+     try {
+       const section = (req.queueProject.a11yReview || []).find((s: any) => String(s._id) === req.params.sectionID);
+       if (!section) return res.status(404).json({ err: true, errMsg: 'Page is not in this project.' });
+-      const endpoints: Record<string, string> = { scan: 'scan', preview: 'preview-fix', 'revise-preview': 'revise-preview', apply: 'apply-fix', snapshots: 'snapshots', 'restore-preview': 'restore-preview', restore: 'restore' };
++      const endpoints: Record<string, string> = { scan: 'scan', preview: 'preview-fix', 'describe-image': 'preview-fix', 'revise-preview': 'revise-preview', apply: 'apply-fix', snapshots: 'snapshots', 'restore-preview': 'restore-preview', restore: 'restore' };
+       const action = req.params.action;
+       if (!endpoints[action]) return res.status(400).json({ err: true, errMsg: 'Unknown page action.' });
+       const url = new URL(section.sectionURL);
+@@ -17,7 +17,7 @@ export function registerRemediationActions(router: any, { base, access, Project,
+       const page = { page_url: section.sectionURL, section_title: section.sectionTitle };
+       // Browser-provided URLs, IDs, snapshots paths and scan evidence are never forwarded.
+       const body = { ...page, finding_ids: req.body.findingIDs, fix_mode: req.body.fixMode,
+-        tier: req.body.tier, preview_hash: req.body.previewHash, preview_token: req.body.previewToken,
++        describe_image: req.body.imageSource, review_images: req.body.reviewImages === true, tier: req.body.tier, preview_hash: req.body.previewHash, preview_token: req.body.previewToken,
+         alt_edits: req.body.altEdits, snapshot_timestamp: req.body.snapshotTimestamp };
+       const scan = () => bridge('scan', { ...page, wcag_review: section.wcagReview, doj_exceptions: section.dojExceptions || [] });
+       const persistScan = async (result: any) => {
+diff --git a/server/util/remediationactions.test.ts b/server/util/remediationactions.test.ts
+index 7c943c73..1dbf9aa0 100644
+--- a/server/util/remediationactions.test.ts
++++ b/server/util/remediationactions.test.ts
+@@ -44,3 +44,17 @@ test('successful restore remains visible and recorded when its rescan fails', as
+   assert.equal(calls[0].body.preview_token, 'reviewed-token'); assert.equal(calls[0].body.snapshot_path, undefined);
+   assert.equal(evidence[0].action, 'restore'); assert.ok(evidence[0].result.snapshot_path);
+ }, true));
++test('complex-image suggestions and preview edits stay scoped and do not write scan evidence', async () => harness(async (url, calls, evidence) => {
++  const response=await send(`${url}/describe-image`, {imageSource:'/image.png',previewToken:'token',page_url:'https://evil.test'});
++  assert.equal(response.status,200);
++  assert.equal(calls[0].action,'preview-fix');
++  assert.equal(calls[0].body.describe_image,'/image.png');
++  assert.equal(calls[0].body.preview_token,'token');
++  assert.equal(calls[0].body.page_url,'https://dev.libretexts.org/Sandboxes/johnnyphung/Test');
++  await send(`${url}/preview`,{reviewImages:true});
++  assert.equal(calls[1].body.review_images,true);
++  await send(`${url}/revise-preview`,{previewToken:'token',altEdits:[{src:'/image.png',text:'Table',longDescription:'Oxygen: 47 percent.'}]});
++  assert.equal(calls[2].body.alt_edits[0].longDescription,'Oxygen: 47 percent.');
++  assert.equal(evidence.length,0);
++  assert.equal((await send(`${url}/describe-image`,{},'auditor')).status,403);
++}));

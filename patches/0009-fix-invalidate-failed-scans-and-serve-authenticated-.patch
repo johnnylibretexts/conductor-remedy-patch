@@ -1,0 +1,191 @@
+From be5d0b3ad154047b36831210b7cae78c728e7ec8 Mon Sep 17 00:00:00 2001
+From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 21:56:46 -0700
+Subject: [PATCH 09/12] fix: invalidate failed scans and serve authenticated
+ report downloads
+
+(cherry picked from commit c3f6303ca6d7523512a4e686cdf8407f8b7415ff)
+---
+ .../src/components/projects/ConformanceReview.tsx   |  6 +++---
+ server/api/conformance.ts                           |  7 +++++++
+ server/api/projects.js                              |  5 ++++-
+ server/api/remediationactions.ts                    | 12 +++++++++---
+ server/util/conformance-api.test.ts                 |  1 +
+ server/util/remediationactions.test.ts              | 13 +++++++++----
+ 6 files changed, 33 insertions(+), 11 deletions(-)
+
+diff --git a/client/src/components/projects/ConformanceReview.tsx b/client/src/components/projects/ConformanceReview.tsx
+index daa1ee37..cbed55bf 100644
+--- a/client/src/components/projects/ConformanceReview.tsx
++++ b/client/src/components/projects/ConformanceReview.tsx
+@@ -8,7 +8,7 @@ function ReviewForm({page,criterion,scope,save,busy}:any) {
+   return <form onSubmit={e=>{e.preventDefault();save('review',{sectionID:page.sectionID,criterionID:criterion.id,fingerprint:page.fingerprint,scopeVersion:scope?.version,status,notes,reason,environment,evidenceURLs:refs.split('\n').map(s=>s.trim()).filter(Boolean),checks,confirmed});}}>
+     <h4>{criterion.id} {criterion.title} — {criterion.status.replace(/_/g,' ')}</h4>
+     {criterion.review && <p>Last review by {criterion.review.actor}, {new Date(criterion.review.at).toLocaleString()}. {criterion.review.notes}</p>}
+-    <a href={`https://www.w3.org/TR/WCAG21/#${criterion.title.toLowerCase().replace(/\([^)]*\)/g,'').trim().replace(/[^a-z0-9]+/g,'-')}`} target="_blank" rel="noreferrer">WCAG criterion</a>
++    <a href={`https://www.w3.org/TR/WCAG21/#${criterion.title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')}`} target="_blank" rel="noreferrer">WCAG criterion</a>
+     {criterion.checklist.map((text:string,i:number)=><label key={i}><input type="checkbox" checked={checks.includes(i)} onChange={e=>setChecks(e.target.checked?[...checks,i]:checks.filter(n=>n!==i))}/> {text}</label>)}
+     <label>Review outcome<select value={status} onChange={e=>setStatus(e.target.value)}><option value="pass">Verified pass</option><option value="fail">Failed review</option><option value="not_applicable">Verified not applicable</option></select></label>
+     {status==='not_applicable' && <label>Why this criterion does not apply<textarea required minLength={20} maxLength={4000} value={reason} onChange={e=>setReason(e.target.value)}/></label>}
+@@ -30,7 +30,7 @@ export default function ConformanceReview({projectID,sections,onScanSaved}:any)
+   async function scan(all=false){setBusy(true);setError('');stop.current=false;const pages=all?data.report.pages:data.report.pages.filter((p:any)=>p.sectionID===sectionID);let count=0,failures=0;
+     try{for(const p of pages){if(stop.current)break;setMessage(`Scanning rendered page ${count+1}/${pages.length}: ${p.title}`);try{const r=await request(`${base}/page/${p.sectionID}/rendered-scan`,{});if(r.scanError || r.wcag_review?.rendered?.state!=='complete')failures++;}catch{failures++;}count++;}await load();onScanSaved?.();setMessage(`${count} rendered pages scanned; ${failures} require scan follow-up. Reviewer verification remains pending.`);}catch(e:any){setError(e.message);}finally{setBusy(false);}}
+   const report=data?.report,page=report?.pages.find((p:any)=>p.sectionID===sectionID),criterion=page?.criteria.find((c:any)=>c.id===criterionID);
+-  function download(){const blob=new Blob([JSON.stringify(report,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`${projectID}-wcag-evaluation.json`;a.click();URL.revokeObjectURL(url);}
++
+   return <section className="ui segment conformance-review" aria-label="WCAG verification">
+     <style>{`.conformance-review label{display:block;margin:.8rem 0}.conformance-review textarea,.conformance-review select,.conformance-review input:not([type=checkbox]){display:block;width:100%;max-width:100%;padding:.5rem;border:1px solid #777;border-radius:4px}.conformance-review details{margin:1rem 0}.conformance-review summary{cursor:pointer;font-weight:600}.conformance-review :focus-visible{outline:3px solid #1565c0;outline-offset:2px}.conformance-review pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto}`}</style>
+     <h2>WCAG verification</h2>
+@@ -38,7 +38,7 @@ export default function ConformanceReview({projectID,sections,onScanSaved}:any)
+     {!report?<p>Loading verification evidence…</p>:<>
+       <p><strong>Verification progress: {report.verificationPercent}%</strong> ({report.verifiedCriteria}/{report.totalCriteria} page criteria). <strong>Conformance: {report.status==='verified_for_evaluated_scope'?'Verified for evaluated scope':'Verification pending'}</strong></p>
+       <p>Full reader pages, navigation, embedded content and complete processes are in scope. Source scans and browser scans do not replace human review. Changes invalidate matching evidence; scans must be refreshed within 24 hours for sign-off.</p>
+-      <button className="ui button" onClick={()=>load().catch(e=>setError(e.message))} disabled={busy}>Refresh verification</button><button className="ui button" onClick={download}>Export evaluation report</button>
++      <button className="ui button" onClick={()=>load().catch(e=>setError(e.message))} disabled={busy}>Refresh verification</button><a className="ui button" href={`/api/v1${base}/conformance/report`} download>Export evaluation report</a>
+       <details><summary>Evaluation scope {report.scope?'— defined':'— required'}</summary>
+         {report.scope && <p>Current scope: {report.scope.boundaries}<br/>Processes: {report.scope.processes}<br/>Platform: {report.scope.platformVersion}</p>}
+         {data.canEdit && <form onSubmit={e=>{e.preventDefault();save('scope',{boundaries,processes,platformVersion,confirmed:scopeConfirmed});}}>
+diff --git a/server/api/conformance.ts b/server/api/conformance.ts
+index 64fa48c3..4b65372c 100644
+--- a/server/api/conformance.ts
++++ b/server/api/conformance.ts
+@@ -17,6 +17,13 @@ export function registerConformance(router:any,{base,access,Records=Record}:any)
+     try {const {report}=await load(req.queueProject);res.json({err:false,canEdit:req.queueCanEdit,criteria,report});}
+     catch {res.status(500).json({err:true,errMsg:'Unable to load conformance evidence.'});}
+   });
++  router.get(`${base}/conformance/report`,...access,async(req:any,res:any)=>{
++    try {const {report}=await load(req.queueProject);
++      res.setHeader('Cache-Control','no-store');
++      res.setHeader('Content-Disposition',`attachment; filename="${req.params.projectID}-wcag-evaluation.json"`);
++      res.json(report);
++    } catch {res.status(500).json({err:true,errMsg:'Unable to export conformance evidence.'});}
++  });
+   router.post(`${base}/conformance/:action`,...access,async(req:any,res:any)=>{
+     try {
+       const {scope,report}=await load(req.queueProject), body=req.body || {};
+diff --git a/server/api/projects.js b/server/api/projects.js
+index 24c93241..787804b6 100644
+--- a/server/api/projects.js
++++ b/server/api/projects.js
+@@ -2954,6 +2954,7 @@ const checkProjectRemedyHealth = async (_req, res) => {
+ 
+ 
+ const scanA11YWithRemedy = async (req, res) => {
++    let authorizedSection;
+     try {
+         const project = await Project.findOne({
+             projectID: req.body.projectID,
+@@ -2970,6 +2971,7 @@ const scanA11YWithRemedy = async (req, res) => {
+             : undefined;
+ 
+         if (!currentSection) throw new Error('notfound');
++        authorizedSection = currentSection;
+         const data = await proxyProjectRemedyRequest('/v1/cxone/page/scan', {
+             page_url: currentSection.sectionURL,
+             section_title: currentSection.sectionTitle,
+@@ -2980,7 +2982,7 @@ const scanA11YWithRemedy = async (req, res) => {
+         if (req.body.sectionID && (data.wcag_review || data.wcagReview || data.doj_exceptions || data.dojExceptions)) {
+             const wcagReview = data.wcag_review || data.wcagReview;
+             const dojExceptions = data.doj_exceptions || data.dojExceptions || [];
+-            const toSet = {};
++            const toSet = { 'a11yReview.$.remedyError': '' };
+             if (wcagReview) {
+                 toSet['a11yReview.$.wcagReview'] = wcagReview;
+             }
+@@ -3002,6 +3004,7 @@ const scanA11YWithRemedy = async (req, res) => {
+             ...data,
+         });
+     } catch (err) {
++        if (authorizedSection) await Project.updateOne({projectID:req.body.projectID,'a11yReview._id':authorizedSection._id}, {$unset:{'a11yReview.$.wcagReview.rendered':'','a11yReview.$.wcagReview.sourceHash':''},$set:{'a11yReview.$.remedyError':'Latest scan failed. Rescan required.'}}).catch(()=>{});
+         let errMsg = conductorErrors.err6;
+         let error = undefined;
+         if (err.message === 'notfound') {
+diff --git a/server/api/remediationactions.ts b/server/api/remediationactions.ts
+index dd0e00ba..9f1f5126 100644
+--- a/server/api/remediationactions.ts
++++ b/server/api/remediationactions.ts
+@@ -1,8 +1,9 @@
+ /** Page actions are always resolved from the authorized project's stored section. */
+ export function registerRemediationActions(router: any, { base, access, Project, WorkItems, bridge = callBridge }: any) {
+   router.post(`${base}/page/:sectionID/:action`, ...access, async (req: any, res: any) => {
++    let section: any;
+     try {
+-      const section = (req.queueProject.a11yReview || []).find((s: any) => String(s._id) === req.params.sectionID);
++      section = (req.queueProject.a11yReview || []).find((s: any) => String(s._id) === req.params.sectionID);
+       if (!section) return res.status(404).json({ err: true, errMsg: 'Page is not in this project.' });
+       const endpoints: Record<string, string> = { scan: 'scan', 'rendered-scan': 'scan', preview: 'preview-fix', 'describe-image': 'preview-fix', 'revise-preview': 'revise-preview', apply: 'apply-fix', snapshots: 'snapshots', 'restore-preview': 'restore-preview', restore: 'restore' };
+       const action = req.params.action;
+@@ -23,7 +24,8 @@ export function registerRemediationActions(router: any, { base, access, Project,
+       const persistScan = async (result: any) => {
+         await Project.updateOne({ projectID: req.params.projectID, 'a11yReview._id': section._id }, {
+           $set: { 'a11yReview.$.wcagReview': result.wcag_review || result.wcagReview,
+-            'a11yReview.$.dojExceptions': result.doj_exceptions || result.dojExceptions || [] },
++            'a11yReview.$.dojExceptions': result.doj_exceptions || result.dojExceptions || [],
++            'a11yReview.$.remedyError': '', 'a11yReview.$.remedyLastScannedAt': new Date() },
+         });
+       };
+       const result = ['scan', 'rendered-scan'].includes(action) ? await scan() : await bridge(endpoints[action], body);
+@@ -48,7 +50,11 @@ export function registerRemediationActions(router: any, { base, access, Project,
+         } catch { evidenceError = 'Page action completed but task evidence could not be saved. Rescan from this task to retry.'; }
+       }
+       res.json({ err: false, ...result, page_url: section.sectionURL, scan: scanResult ? { ...scanResult, page_url: section.sectionURL } : null, scanError, evidenceError });
+-    } catch (e: any) { res.status(e.status || 500).json({ err: true, errMsg: e.publicMessage || 'Page action failed. Refresh and try again.' }); }
++    } catch (e: any) {
++      if (section && ['scan','rendered-scan','apply','restore'].includes(req.params.action)) {
++        await Project.updateOne({projectID:req.params.projectID,'a11yReview._id':section._id}, {$unset:{'a11yReview.$.wcagReview.rendered':'','a11yReview.$.wcagReview.sourceHash':''},$set:{'a11yReview.$.remedyError':'Latest page action or scan failed. Rescan required.'}}).catch(()=>{});
++      }
++      res.status(e.status || 500).json({ err: true, errMsg: e.publicMessage || 'Page action failed. Refresh and try again.' }); }
+   });
+ }
+ 
+diff --git a/server/util/conformance-api.test.ts b/server/util/conformance-api.test.ts
+index 10b2e0d3..1124c42a 100644
+--- a/server/util/conformance-api.test.ts
++++ b/server/util/conformance-api.test.ts
+@@ -12,6 +12,7 @@ test('conformance API binds reviewer identity, rejects forged/stale evidence and
+  const post=(action:string,body:any,user='reviewer')=>fetch(`${base}/${action}`,{method:'POST',headers:{'Content-Type':'application/json','x-user':user},body:JSON.stringify(body)});
+  try{
+   assert.equal((await post('review',{},'outsider')).status,403);
++  const exported=await fetch(`${base}/report`,{headers:{'x-user':'reviewer'}});assert.equal(exported.status,200);assert.match(exported.headers.get('content-disposition') || '',/attachment/);assert.equal((await exported.json()).status,'verification_pending');
+   assert.equal((await post('signoff',{confirmed:true,digest:'forged',statement:'All of the book pages have supposedly passed the review.'})).status,400);
+   const body={sectionID:'p1',criterionID:'1.1.1',fingerprint:pageFingerprint(section),scopeVersion:'scope1',status:'pass',notes:'Compared mathematical meaning with screen reader output and visual content.',environment:'OS / Browser / Screen reader versions',evidenceURLs:[],checks:[0,1],confirmed:true,actor:'forged'};
+   assert.equal((await post('review',{...body,fingerprint:'forged'})).status,400);
+diff --git a/server/util/remediationactions.test.ts b/server/util/remediationactions.test.ts
+index 1dbf9aa0..482c7212 100644
+--- a/server/util/remediationactions.test.ts
++++ b/server/util/remediationactions.test.ts
+@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
+ import express from 'express';
+ import { registerRemediationQueue } from '../api/remediationqueue.js';
+ 
+-async function harness(run: (url: string, calls: any[], evidence: any[], row: any) => Promise<void>, failScan = false) {
+-  const calls: any[] = [], evidence: any[] = [];
++async function harness(run: (url: string, calls: any[], evidence: any[], row: any, updates: any[]) => Promise<void>, failScan = false) {
++  const calls: any[] = [], evidence: any[] = [], updates: any[] = [];
+   const section = { _id: 'section1', sectionURL: 'https://dev.libretexts.org/Sandboxes/johnnyphung/Test', sectionTitle: 'Test' };
+   const row = { _id: '012345678901234567890123', projectID: 'demo', sectionID: 'section1', ruleId: 'img-alt', selector: 'img', criterionID: '1.1.1', status: 'in_progress' };
+   const project = { projectID: 'demo', members: ['alice'], auditors: ['auditor'], a11yReview: [section] };
+@@ -12,12 +12,12 @@ async function harness(run: (url: string, calls: any[], evidence: any[], row: an
+   registerRemediationQueue(app, {
+     auth: { verifyRequest: (req: any, res: any, next: any) => { if (!req.headers['x-user']) return res.sendStatus(401); req.user = { decoded: { uuid: req.headers['x-user'] } }; next(); }, getUserAttributes: (_r: any, _s: any, n: any) => n(), checkHasRole: () => false },
+     projects: { checkProjectMemberPermission: (p: any, u: any) => [...p.members, ...p.auditors].includes(u.decoded.uuid) },
+-    Project: { findOne: () => ({ lean: async () => project }), updateOne: async () => {} }, User: {},
++    Project: { findOne: () => ({ lean: async () => project }), updateOne: async (_filter:any, update:any) => {updates.push(update);} }, User: {},
+     WorkItems: { findOne: (filter: any) => ({ lean: async () => filter._id === row._id && filter.sectionID === row.sectionID && filter.projectID === row.projectID ? row : null }), updateOne: async (_f: any, update: any) => { evidence.push(update.$push.scanEvidence); } },
+     bridge: async (action: string, body: any) => { calls.push({ action, body }); if (action === 'scan') { if (failScan) throw Error('down'); return { scanned_at: 'now', findings: [], wcag_review: { criteria: [{ id: '1.1.1', status: 'pass' }] } }; } return { applied: true, snapshot_path: '/data/snapshot.json' }; },
+   });
+   const server = app.listen(0, '127.0.0.1'); await new Promise<void>(r => server.once('listening', r));
+-  try { await run(`http://127.0.0.1:${(server.address() as any).port}/project/demo/accessibility/workqueue/page/section1`, calls, evidence, row); }
++  try { await run(`http://127.0.0.1:${(server.address() as any).port}/project/demo/accessibility/workqueue/page/section1`, calls, evidence, row, updates); }
+   finally { await new Promise<void>(r => server.close(() => r())); }
+ }
+ const send = (url: string, body = {}, user = 'alice') => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(user ? { 'x-user': user } : {}) }, body: JSON.stringify(body) });
+@@ -58,3 +58,8 @@ test('complex-image suggestions and preview edits stay scoped and do not write s
+   assert.equal(evidence.length,0);
+   assert.equal((await send(`${url}/describe-image`,{},'auditor')).status,403);
+ }));
++
++test('rendered scans use the stored URL and failed rescans invalidate previous evidence',async()=>{
++ await harness(async(url,calls)=>{assert.equal((await send(`${url}/rendered-scan`,{page_url:'https://evil.test'})).status,200);assert.equal(calls[0].body.rendered,true);assert.match(calls[0].body.page_url,/johnnyphung/);});
++ await harness(async(url,_calls,_evidence,_row,updates)=>{assert.equal((await send(`${url}/scan`)).status,500);assert.ok(updates.some(u=>u.$unset?.['a11yReview.$.wcagReview.sourceHash'] === ''));},true);
++});

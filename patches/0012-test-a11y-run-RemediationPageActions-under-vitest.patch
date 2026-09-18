@@ -1,0 +1,58 @@
+From cb450f21f5615baacce1be92fb53e76786a34932 Mon Sep 17 00:00:00 2001
+From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 07:18:07 -0700
+Subject: [PATCH 12/12] test(a11y): run RemediationPageActions under vitest
+
+The test imported node:test and built its own JSDOM, so `npm test` in
+client/ (vitest) failed to bundle it. Use vitest's jsdom environment and
+expect() instead; scenarios and assertions are unchanged.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../projects/RemediationPageActions.test.ts   | 25 +++++++++----------
+ 1 file changed, 12 insertions(+), 13 deletions(-)
+
+diff --git a/client/src/components/projects/RemediationPageActions.test.ts b/client/src/components/projects/RemediationPageActions.test.ts
+index ec3e9b3f..3fa9dc7e 100644
+--- a/client/src/components/projects/RemediationPageActions.test.ts
++++ b/client/src/components/projects/RemediationPageActions.test.ts
+@@ -1,27 +1,26 @@
+-import assert from 'node:assert/strict';
+-import test from 'node:test';
++import { expect, test } from 'vitest';
+ import React, { act } from 'react';
+ import { createRoot } from 'react-dom/client';
+-import { JSDOM } from 'jsdom';
+ import RemediationPageActions from './RemediationPageActions';
+ 
++(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
++
+ for (const scenario of [{item:false,error:false},{item:true,error:false},{item:false,error:true}]) {
+   test(`scan updates matrix only after persistence and reports task evidence accurately: ${JSON.stringify(scenario)}`, async () => {
+-    const dom = new JSDOM('<div id="root"></div>', { url: 'https://example.test' });
+-    const oldWindow=globalThis.window, oldDocument=globalThis.document;
+-    Object.assign(globalThis,{window:dom.window,document:dom.window.document,IS_REACT_ACT_ENVIRONMENT:true});
+-    const root=createRoot(document.getElementById('root')!);let saved=0;
++    const container = document.createElement('div');
++    document.body.appendChild(container);
++    const root=createRoot(container);let saved=0;
+     try {
+       await act(async()=>root.render(React.createElement(RemediationPageActions,{
+         base:'/test',section:{id:'page',title:'Page'},item:scenario.item ? {_id:'task',title:'Image'}:undefined,
+         request:async()=>({findings:[],scanned_at:'2026-09-13',scanError:scenario.error ? 'Matrix save failed':undefined}),
+         refreshed:async()=>{},onScanSaved:()=>saved++,close:()=>{},
+       })));
+-      await act(async()=>Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Rescan page')!.click());
+-      assert.equal(saved,scenario.error ? 0:1);
+-      assert.equal(document.body.textContent?.includes('Evidence attached to the task'),scenario.item && !scenario.error);
+-      assert.equal(document.body.textContent?.includes('Matrix save failed'),scenario.error);
+-      assert.equal(document.body.textContent?.includes('Reload matrix from saved scan'),false);
+-    } finally {await act(async()=>root.unmount());Object.assign(globalThis,{window:oldWindow,document:oldDocument});dom.window.close();}
++      await act(async()=>Array.from(container.querySelectorAll('button')).find(b=>b.textContent==='Rescan page')!.click());
++      expect(saved).toBe(scenario.error ? 0:1);
++      expect(container.textContent?.includes('Evidence attached to the task')).toBe(scenario.item && !scenario.error);
++      expect(container.textContent?.includes('Matrix save failed')).toBe(scenario.error);
++      expect(container.textContent?.includes('Reload matrix from saved scan')).toBe(false);
++    } finally {await act(async()=>root.unmount());container.remove();}
+   });
+ }

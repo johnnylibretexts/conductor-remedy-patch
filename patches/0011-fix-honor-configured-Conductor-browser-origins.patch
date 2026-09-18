@@ -1,0 +1,87 @@
+From 41413494ca5840aa8d6099e9490cbc6253b868af Mon Sep 17 00:00:00 2001
+From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 07:16:25 -0700
+Subject: [PATCH 11/12] fix: honor configured Conductor browser origins
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Seed the CORS allow-list from PRODUCTIONURLS even when NODE_ENV is unset,
+so browser-driven scans from the deployed Commons origin are accepted.
+
+(cherry picked from commit 60d58f09; the deployment docker-compose.yml
+hunk was dropped — it belongs to the reference deployment, not the feature)
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ server/api.js                  |  3 ++-
+ server/util/corsPolicy.test.ts | 46 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+), 1 deletion(-)
+ create mode 100644 server/util/corsPolicy.test.ts
+
+diff --git a/server/api.js b/server/api.js
+index eecbdf5c..ddedbd32 100644
+--- a/server/api.js
++++ b/server/api.js
+@@ -75,7 +75,8 @@ import restackerAPI from "./api/restacker.js";
+ const corsMiddleware = cors({
+   origin(origin, callback) {
+     /* Build dynamic origins list */
+-    let allowedOrigins = [];
++    // Honor explicit deployment origins even when NODE_ENV is unset.
++    let allowedOrigins = String(process.env.PRODUCTIONURLS || "").split(",").map((url) => url.trim()).filter(Boolean);
+ 
+     // Allow same-origin requests
+     if (!origin) {
+diff --git a/server/util/corsPolicy.test.ts b/server/util/corsPolicy.test.ts
+new file mode 100644
+index 00000000..bdd8bf3d
+--- /dev/null
++++ b/server/util/corsPolicy.test.ts
+@@ -0,0 +1,46 @@
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import { runInNewContext } from 'node:vm';
++import test from 'node:test';
++
++// Exercise the actual API policy without starting MongoDB, mail, or the app.
++const api = readFileSync(new URL('../api.js', import.meta.url), 'utf8');
++const start = api.indexOf('const corsMiddleware = cors({');
++assert.notEqual(start, -1);
++const end = api.indexOf('\n});', start);
++assert.notEqual(end, -1);
++const policySource = `${api.slice(start, end + 4)}\ncorsMiddleware;`;
++
++function accepts(env: Record<string, string>, origin?: string): boolean {
++  const policy = runInNewContext(policySource, {
++    process: { env },
++    cors: (options: unknown) => options,
++  });
++  let allowed = false;
++  policy.origin(origin, (error: unknown, result: unknown) => {
++    allowed = !error && Boolean(result);
++  });
++  return allowed;
++}
++
++test('demo browser origins work with APP_ENV=production and NODE_ENV unset', () => {
++  const env = {
++    APP_ENV: 'production',
++    PRODUCTIONURLS: 'libretexts.dev, https://commons.libretexts.dev, https://conductor.libretexts.dev',
++  };
++  assert.equal(accepts(env, 'https://commons.libretexts.dev'), true);
++  assert.equal(accepts(env, 'https://conductor.libretexts.dev'), true);
++  assert.equal(accepts(env, 'https://untrusted.example'), false);
++  assert.equal(accepts(env, 'https://commons.libretexts.dev.untrusted.example'), false);
++  assert.equal(accepts(env), true);
++});
++
++test('development origin configuration stays isolated', () => {
++  const env = {
++    NODE_ENV: 'development',
++    DEVELOPMENTURLS: 'http://localhost:5000',
++    PRODUCTIONURLS: 'https://commons.libretexts.dev',
++  };
++  assert.equal(accepts(env, 'http://localhost:5000'), true);
++  assert.equal(accepts(env, 'https://commons.libretexts.dev'), false);
++});

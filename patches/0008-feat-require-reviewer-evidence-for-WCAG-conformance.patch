@@ -1,0 +1,886 @@
+From 44c0009f26c7d4f8dc57db1eb91041c7170af92d Mon Sep 17 00:00:00 2001
+From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 21:34:42 -0700
+Subject: [PATCH 08/12] feat: require reviewer evidence for WCAG conformance
+
+(cherry picked from commit c02ed17db66114327c1e985024c55a5a72b84974)
+---
+ .../components/projects/ConformanceReview.tsx |  70 +++
+ .../projects/ProjectAccessibility.jsx         |   6 +-
+ docs/accessibility-verification.md            |  13 +
+ server/api/conformance.ts                     |  41 ++
+ server/api/projects.js                        |   6 +-
+ server/api/remediationactions.ts              |  13 +-
+ server/api/remediationqueue.ts                |   2 +
+ server/util/conformance-api.test.ts           |  20 +
+ server/util/conformance.test.ts               |  28 ++
+ server/util/conformance.ts                    |  60 +++
+ server/util/conformanceCriteria.json          | 452 ++++++++++++++++++
+ server/util/remediationqueue.ts               |   4 +-
+ 12 files changed, 702 insertions(+), 13 deletions(-)
+ create mode 100644 client/src/components/projects/ConformanceReview.tsx
+ create mode 100644 docs/accessibility-verification.md
+ create mode 100644 server/api/conformance.ts
+ create mode 100644 server/util/conformance-api.test.ts
+ create mode 100644 server/util/conformance.test.ts
+ create mode 100644 server/util/conformance.ts
+ create mode 100644 server/util/conformanceCriteria.json
+
+diff --git a/client/src/components/projects/ConformanceReview.tsx b/client/src/components/projects/ConformanceReview.tsx
+new file mode 100644
+index 00000000..daa1ee37
+--- /dev/null
++++ b/client/src/components/projects/ConformanceReview.tsx
+@@ -0,0 +1,70 @@
++import React, { useEffect, useRef, useState } from 'react';
++async function request(path:string,body?:unknown) {
++  const r=await fetch(`/api/v1${path}`,{method:body?'POST':'GET',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},...(body?{body:JSON.stringify(body)}:{})});
++  const data=await r.json();if(!r.ok || data.err) throw Error(data.errMsg || 'Conformance request failed.');return data;
++}
++function ReviewForm({page,criterion,scope,save,busy}:any) {
++  const [status,setStatus]=useState('pass'),[notes,setNotes]=useState(''),[reason,setReason]=useState(''),[environment,setEnvironment]=useState(''),[refs,setRefs]=useState(''),[checks,setChecks]=useState<number[]>([]),[confirmed,setConfirmed]=useState(false);
++  return <form onSubmit={e=>{e.preventDefault();save('review',{sectionID:page.sectionID,criterionID:criterion.id,fingerprint:page.fingerprint,scopeVersion:scope?.version,status,notes,reason,environment,evidenceURLs:refs.split('\n').map(s=>s.trim()).filter(Boolean),checks,confirmed});}}>
++    <h4>{criterion.id} {criterion.title} — {criterion.status.replace(/_/g,' ')}</h4>
++    {criterion.review && <p>Last review by {criterion.review.actor}, {new Date(criterion.review.at).toLocaleString()}. {criterion.review.notes}</p>}
++    <a href={`https://www.w3.org/TR/WCAG21/#${criterion.title.toLowerCase().replace(/\([^)]*\)/g,'').trim().replace(/[^a-z0-9]+/g,'-')}`} target="_blank" rel="noreferrer">WCAG criterion</a>
++    {criterion.checklist.map((text:string,i:number)=><label key={i}><input type="checkbox" checked={checks.includes(i)} onChange={e=>setChecks(e.target.checked?[...checks,i]:checks.filter(n=>n!==i))}/> {text}</label>)}
++    <label>Review outcome<select value={status} onChange={e=>setStatus(e.target.value)}><option value="pass">Verified pass</option><option value="fail">Failed review</option><option value="not_applicable">Verified not applicable</option></select></label>
++    {status==='not_applicable' && <label>Why this criterion does not apply<textarea required minLength={20} maxLength={4000} value={reason} onChange={e=>setReason(e.target.value)}/></label>}
++    <label>Test environment: OS, browser, assistive technology and versions<input required minLength={5} maxLength={1000} value={environment} onChange={e=>setEnvironment(e.target.value)}/></label>
++    <label>Evidence and results, including all scanner incomplete checks for this criterion<textarea required rows={4} minLength={20} maxLength={12000} value={notes} onChange={e=>setNotes(e.target.value)}/></label>
++    <label>Evidence attachment links (HTTPS, one per line)<textarea rows={2} value={refs} onChange={e=>setRefs(e.target.value)}/></label>
++    <label><input type="checkbox" checked={confirmed} onChange={e=>setConfirmed(e.target.checked)}/> I performed this review over the defined scope and confirm the evidence supports this outcome.</label>
++    <button className="ui primary button" disabled={busy || !scope || !confirmed}>Save reviewer evidence</button>
++  </form>;
++}
++export default function ConformanceReview({projectID,sections,onScanSaved}:any) {
++  const [data,setData]=useState<any>(null),[error,setError]=useState(''),[message,setMessage]=useState(''),[busy,setBusy]=useState(false),[sectionID,setSectionID]=useState(''),[criterionID,setCriterionID]=useState('1.1.1');
++  const [boundaries,setBoundaries]=useState(''),[processes,setProcesses]=useState(''),[platformVersion,setPlatformVersion]=useState(''),[scopeConfirmed,setScopeConfirmed]=useState(false),[statement,setStatement]=useState(''),[signed,setSigned]=useState(false);
++  const stop=useRef(false),generation=useRef(0);
++  const base=`/project/${encodeURIComponent(projectID)}/accessibility/workqueue`;
++  async function load(){const n=++generation.current;const d=await request(`${base}/conformance`);if(n===generation.current)setData(d);}
++  useEffect(()=>{load().catch(e=>setError(e.message));return()=>{generation.current++;stop.current=true;};},[projectID,sections]);
++  async function save(action:string,body:any){setBusy(true);setError('');try{await request(`${base}/conformance/${action}`,body);await load();setMessage('Review record saved.');}catch(e:any){setError(e.message);}finally{setBusy(false);}}
++  async function scan(all=false){setBusy(true);setError('');stop.current=false;const pages=all?data.report.pages:data.report.pages.filter((p:any)=>p.sectionID===sectionID);let count=0,failures=0;
++    try{for(const p of pages){if(stop.current)break;setMessage(`Scanning rendered page ${count+1}/${pages.length}: ${p.title}`);try{const r=await request(`${base}/page/${p.sectionID}/rendered-scan`,{});if(r.scanError || r.wcag_review?.rendered?.state!=='complete')failures++;}catch{failures++;}count++;}await load();onScanSaved?.();setMessage(`${count} rendered pages scanned; ${failures} require scan follow-up. Reviewer verification remains pending.`);}catch(e:any){setError(e.message);}finally{setBusy(false);}}
++  const report=data?.report,page=report?.pages.find((p:any)=>p.sectionID===sectionID),criterion=page?.criteria.find((c:any)=>c.id===criterionID);
++  function download(){const blob=new Blob([JSON.stringify(report,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`${projectID}-wcag-evaluation.json`;a.click();URL.revokeObjectURL(url);}
++  return <section className="ui segment conformance-review" aria-label="WCAG verification">
++    <style>{`.conformance-review label{display:block;margin:.8rem 0}.conformance-review textarea,.conformance-review select,.conformance-review input:not([type=checkbox]){display:block;width:100%;max-width:100%;padding:.5rem;border:1px solid #777;border-radius:4px}.conformance-review details{margin:1rem 0}.conformance-review summary{cursor:pointer;font-weight:600}.conformance-review :focus-visible{outline:3px solid #1565c0;outline-offset:2px}.conformance-review pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto}`}</style>
++    <h2>WCAG verification</h2>
++    {error && <p role="alert" className="ui negative message">{error}</p>}<p role="status">{message}</p>
++    {!report?<p>Loading verification evidence…</p>:<>
++      <p><strong>Verification progress: {report.verificationPercent}%</strong> ({report.verifiedCriteria}/{report.totalCriteria} page criteria). <strong>Conformance: {report.status==='verified_for_evaluated_scope'?'Verified for evaluated scope':'Verification pending'}</strong></p>
++      <p>Full reader pages, navigation, embedded content and complete processes are in scope. Source scans and browser scans do not replace human review. Changes invalidate matching evidence; scans must be refreshed within 24 hours for sign-off.</p>
++      <button className="ui button" onClick={()=>load().catch(e=>setError(e.message))} disabled={busy}>Refresh verification</button><button className="ui button" onClick={download}>Export evaluation report</button>
++      <details><summary>Evaluation scope {report.scope?'— defined':'— required'}</summary>
++        {report.scope && <p>Current scope: {report.scope.boundaries}<br/>Processes: {report.scope.processes}<br/>Platform: {report.scope.platformVersion}</p>}
++        {data.canEdit && <form onSubmit={e=>{e.preventDefault();save('scope',{boundaries,processes,platformVersion,confirmed:scopeConfirmed});}}>
++          <label>Full-page boundaries and included content<textarea required minLength={10} maxLength={12000} value={boundaries} onChange={e=>setBoundaries(e.target.value)}/></label>
++          <label>Complete processes and interaction states to evaluate<textarea required minLength={10} maxLength={12000} value={processes} onChange={e=>setProcesses(e.target.value)}/></label>
++          <label>Platform release and relevant configuration<textarea required minLength={10} maxLength={12000} value={platformVersion} onChange={e=>setPlatformVersion(e.target.value)}/></label>
++          <label><input type="checkbox" checked={scopeConfirmed} onChange={e=>setScopeConfirmed(e.target.checked)}/> This scope covers full pages and complete processes. Saving a new scope invalidates previous sign-offs and criterion reviews.</label>
++          <button className="ui button" disabled={busy || !scopeConfirmed}>Save evaluation scope</button>
++        </form>}
++      </details>
++      <label>Page to evaluate<select value={sectionID} onChange={e=>setSectionID(e.target.value)}><option value="">Select a page</option>{report.pages.map((p:any)=><option key={p.sectionID} value={p.sectionID}>{p.title} ({p.blockers.length?'scan blockers':p.criteria.filter((c:any)=>['pass','not_applicable'].includes(c.status)).length+'/50 reviewed'})</option>)}</select></label>
++      {data.canEdit && <><button className="ui primary button" disabled={busy || !page} onClick={()=>scan()}>Scan rendered page</button><button className="ui button" disabled={busy || !report.pages.length} onClick={()=>scan(true)}>Scan all rendered pages</button>{busy && <button className="ui button" onClick={()=>{stop.current=true;}}>Stop after current page</button>}</>}
++      {page && <><p><a href={page.url} target="_blank" rel="noreferrer">Open full reader page</a></p>
++        {page.blockers.length>0 && <ul>{page.blockers.map((b:string)=><li key={b}>{b}</li>)}</ul>}
++        <details><summary>Rendered scan evidence and unresolved checks</summary><pre>{JSON.stringify(page.sourceScan?.rendered || {state:'not_tested'},null,2)}</pre></details>
++        <label>Criterion<select value={criterionID} onChange={e=>setCriterionID(e.target.value)}>{page.criteria.map((c:any)=><option key={c.id} value={c.id}>{c.id} {c.title} — {c.status.replace(/_/g,' ')}</option>)}</select></label>
++        {criterion && data.canEdit && <ReviewForm key={`${sectionID}-${criterionID}-${report.scope?.version}`} page={page} criterion={criterion} scope={report.scope} save={save} busy={busy}/>}
++      </>}
++      <details><summary>Reviewer conformance sign-off</summary><p>Available after every criterion on every scoped page has fresh evidence and no unresolved failures. Legal exceptions do not establish WCAG conformance.</p>
++        {report.signoff && <p>Signed by {report.signoff.actor} on {new Date(report.signoff.at).toLocaleString()}: {report.signoff.statement}</p>}
++        {data.canEdit && <form onSubmit={e=>{e.preventDefault();save('signoff',{digest:report.digest,statement,confirmed:signed});}}>
++          <label>Reviewer statement<textarea value={statement} minLength={40} maxLength={4000} required onChange={e=>setStatement(e.target.value)}/></label>
++          <label><input type="checkbox" checked={signed} onChange={e=>setSigned(e.target.checked)}/> I confirm the evaluated scope meets WCAG 2.1 Level AA based on the recorded evidence.</label>
++          <button className="ui primary button" disabled={busy || !report.readyForSignoff || !signed}>Sign evaluated scope</button>
++        </form>}
++      </details>
++    </>}
++  </section>;
++}
+diff --git a/client/src/components/projects/ProjectAccessibility.jsx b/client/src/components/projects/ProjectAccessibility.jsx
+index dc3e0169..6e6652d6 100644
+--- a/client/src/components/projects/ProjectAccessibility.jsx
++++ b/client/src/components/projects/ProjectAccessibility.jsx
+@@ -41,6 +41,7 @@ import useGlobalError from '../error/ErrorHooks';
+ import api from '../../api';
+ import { computeA11yScore, computeWcagProjectSummary } from './accessibilityScore';
+ import RemediationWorkQueue from './RemediationWorkQueue';
++import ConformanceReview from './ConformanceReview';
+ 
+ const SUPPORTED_SCAN_KEYS = [
+     'imgAltText',
+@@ -1514,10 +1515,10 @@ const ProjectAccessibility = (props) => {
+                                             <Segment className='flex-row-div mt-1p wcag-summary-segment'>
+                                                 <div className='left-flex wcag-summary-main'>
+                                                     <p id='project-accessibility-score-header'>
+-                                                        Accessibility Score: <span className={scoreClass}>{scoreDisplay}</span>
++                                                        Automated check score: <span className={scoreClass}>{scoreDisplay}</span>
+                                                     </p>
+                                                     <p className='wcag-workflow-note'>
+-                                                        Remedy scans each page against DOJ Title II WCAG 2.1 A/AA. Fails are issues Remedy found automatically; manual review, not tested, not applicable, and verified exceptions are shown separately.
++                                                        This percentage covers automated passes and failures only. It does not establish WCAG conformance. Untested criteria, manual review, stale evidence and full-page behavior require verification below.
+                                                     </p>
+                                                 </div>
+                                                 <div className='right-flex wcag-summary-actions'>
+@@ -1558,6 +1559,7 @@ const ProjectAccessibility = (props) => {
+                                                     }
+                                                 </div>
+                                             </Segment>
++                                            <ConformanceReview projectID={props.match.params.id} sections={reviewSections} onScanSaved={() => getReviewSections({ persistScore: true })} />
+                                             <RemediationWorkQueue projectID={props.match.params.id} onScanSaved={() => getReviewSections({ persistScore: true })} />
+                                             <WcagReviewTable
+                                                 sections={reviewSections}
+diff --git a/docs/accessibility-verification.md b/docs/accessibility-verification.md
+new file mode 100644
+index 00000000..c7338498
+--- /dev/null
++++ b/docs/accessibility-verification.md
+@@ -0,0 +1,13 @@
++# WCAG verification
++
++The matrix's automated check score is the fraction of automated passes and failures. It is not a conformance score. The WCAG verification panel separately tracks all 50 WCAG 2.1 Level A/AA criteria for every listed page.
++
++Reviewers first define the full-page boundaries, complete processes and interaction states, and platform release/configuration. Each criterion has a specific checklist. Saving evidence requires a current source/rendered fingerprint, scope version, test environment, detailed results, completed checklist and reviewer confirmation. Optional HTTPS links attach external evidence artifacts. Not-applicable outcomes require a reason. The server records the authenticated reviewer and timestamp; clients cannot supply them. Records are append-only. Work-queue verification is task progress and does not sign off WCAG criteria.
++
++`GET /api/v1/project/:projectID/accessibility/workqueue/conformance` supplies the scoped report. POST actions at `/conformance/scope`, `/conformance/review`, and `/conformance/signoff` require project editing permission. They share the work queue's authentication and authorization. The report includes page URLs, scanner evidence, versions, reviewer results, scope, sign-off and limitations. Export is available while pending, with pending status intact.
++
++Rendered scans run through `/page/:sectionID/rendered-scan`, which resolves the URL from the authorized project's stored section. Source and rendered hashes must match. Missing/failed/incomplete resource loads, missing criteria, automated failures, stale scans (24 hours), unreviewed or failed criteria and stale scope/content/platform evidence block sign-off. A scan pass or legal exception cannot establish WCAG conformance. Full-page findings are labeled for developer review in the work queue and are not automatically writable.
++
++A reviewer can sign only after all criteria for all listed pages are current and verified. The statement binds to a digest of scope, page fingerprints and review records. Scope/content/rendering changes invalidate it. Exported reports are dated evidence snapshots, not promises about future content or a third-party certification. Changes outside the application are detected on rescan; scan freshness limits this gap.
++
++Human tests must cover mathematical meaning and navigability, duplicate announcements, keyboard interaction, zoom/reflow/text spacing, media and complex images, linguistic accuracy, and the complete reader processes defined in scope. Never auto-populate these results from AI inference or axe checks.
+diff --git a/server/api/conformance.ts b/server/api/conformance.ts
+new file mode 100644
+index 00000000..64fa48c3
+--- /dev/null
++++ b/server/api/conformance.ts
+@@ -0,0 +1,41 @@
++import mongoose from 'mongoose';
++import { randomUUID } from 'node:crypto';
++import { criteria, conformanceReport, validateReview } from '../util/conformance.js';
++const recordSchema = new mongoose.Schema({projectID:String,sectionID:String,criterionID:String,kind:String,
++  fingerprint:String,scopeVersion:String,status:String,actor:String,at:Date,data:mongoose.Schema.Types.Mixed}, {timestamps:true});
++recordSchema.index({projectID:1,kind:1,createdAt:-1});
++const Record = mongoose.models.ConformanceRecord || mongoose.model('ConformanceRecord',recordSchema);
++export function registerConformance(router:any,{base,access,Records=Record}:any) {
++  const load=async(project:any)=>{
++    const records=await Records.find({projectID:project.projectID}).sort({createdAt:-1,_id:-1}).lean();
++    const scope=records.find((r:any)=>r.kind==='scope')?.data;
++    const reviews=records.filter((r:any)=>r.kind==='review').map((r:any)=>({...r.data,_id:r._id,sectionID:r.sectionID,actor:r.actor,at:r.at}));
++    const signoffs=records.filter((r:any)=>r.kind==='signoff').map((r:any)=>({...r.data,actor:r.actor,at:r.at}));
++    return {scope,report:conformanceReport(project,scope,reviews,signoffs)};
++  };
++  router.get(`${base}/conformance`,...access,async(req:any,res:any)=>{
++    try {const {report}=await load(req.queueProject);res.json({err:false,canEdit:req.queueCanEdit,criteria,report});}
++    catch {res.status(500).json({err:true,errMsg:'Unable to load conformance evidence.'});}
++  });
++  router.post(`${base}/conformance/:action`,...access,async(req:any,res:any)=>{
++    try {
++      const {scope,report}=await load(req.queueProject), body=req.body || {};
++      let kind=req.params.action,data:any,sectionID='',criterionID='';
++      if(kind==='scope') {
++        for(const key of ['boundaries','processes','platformVersion']) if(typeof body[key]!=='string' || body[key].trim().length<10 || body[key].length>12000) throw Error('Define full-page boundaries, complete processes/states and the platform version (10–12,000 characters each).');
++        if(body.confirmed!==true) throw Error('Confirm the scope includes full pages, embedded content and complete processes.');
++        data={version:randomUUID(),boundaries:body.boundaries.trim(),processes:body.processes.trim(),platformVersion:body.platformVersion.trim(),standard:'WCAG 2.1 Level AA',definedBy:req.user.decoded.uuid,definedAt:new Date().toISOString()};
++      } else if(kind==='review') {
++        const section=(req.queueProject.a11yReview || []).find((s:any)=>String(s._id)===body.sectionID);
++        if(!section) throw Error('Page is not in this project.');
++        data=validateReview(body,section,scope);sectionID=body.sectionID;criterionID=data.criterionID;
++      } else if(kind==='signoff') {
++        if(!report.readyForSignoff || report.digest!==body.digest) throw Error('All pages and criteria require current verified evidence before sign-off.');
++        if(body.confirmed!==true || typeof body.statement!=='string' || body.statement.trim().length<40 || body.statement.length>4000) throw Error('Provide and confirm a reviewer conformance statement (40–4,000 characters).');
++        data={digest:report.digest,scopeVersion:scope.version,statement:body.statement.trim()};
++      } else throw Error('Unknown conformance action.');
++      await Records.create({projectID:req.params.projectID,kind,sectionID,criterionID,actor:req.user.decoded.uuid,at:new Date(),data});
++      res.json({err:false});
++    } catch(e:any) {res.status(400).json({err:true,errMsg:e.message || 'Unable to save conformance evidence.'});}
++  });
++}
+diff --git a/server/api/projects.js b/server/api/projects.js
+index a9c43f9c..24c93241 100644
+--- a/server/api/projects.js
++++ b/server/api/projects.js
+@@ -2969,10 +2969,10 @@ const scanA11YWithRemedy = async (req, res) => {
+             ? project.a11yReview.find((section) => String(section._id) === String(req.body.sectionID))
+             : undefined;
+ 
++        if (!currentSection) throw new Error('notfound');
+         const data = await proxyProjectRemedyRequest('/v1/cxone/page/scan', {
+-            page_url: req.body.sectionURL,
+-            page_id: req.body.pageID,
+-            section_title: req.body.sectionTitle,
++            page_url: currentSection.sectionURL,
++            section_title: currentSection.sectionTitle,
+             wcag_review: currentSection?.wcagReview,
+             doj_exceptions: Array.isArray(currentSection?.dojExceptions) ? currentSection.dojExceptions : [],
+         });
+diff --git a/server/api/remediationactions.ts b/server/api/remediationactions.ts
+index f76352b6..dd0e00ba 100644
+--- a/server/api/remediationactions.ts
++++ b/server/api/remediationactions.ts
+@@ -4,7 +4,7 @@ export function registerRemediationActions(router: any, { base, access, Project,
+     try {
+       const section = (req.queueProject.a11yReview || []).find((s: any) => String(s._id) === req.params.sectionID);
+       if (!section) return res.status(404).json({ err: true, errMsg: 'Page is not in this project.' });
+-      const endpoints: Record<string, string> = { scan: 'scan', preview: 'preview-fix', 'describe-image': 'preview-fix', 'revise-preview': 'revise-preview', apply: 'apply-fix', snapshots: 'snapshots', 'restore-preview': 'restore-preview', restore: 'restore' };
++      const endpoints: Record<string, string> = { scan: 'scan', 'rendered-scan': 'scan', preview: 'preview-fix', 'describe-image': 'preview-fix', 'revise-preview': 'revise-preview', apply: 'apply-fix', snapshots: 'snapshots', 'restore-preview': 'restore-preview', restore: 'restore' };
+       const action = req.params.action;
+       if (!endpoints[action]) return res.status(400).json({ err: true, errMsg: 'Unknown page action.' });
+       const url = new URL(section.sectionURL);
+@@ -19,29 +19,30 @@ export function registerRemediationActions(router: any, { base, access, Project,
+       const body = { ...page, finding_ids: req.body.findingIDs, fix_mode: req.body.fixMode,
+         describe_image: req.body.imageSource, review_images: req.body.reviewImages === true, tier: req.body.tier, preview_hash: req.body.previewHash, preview_token: req.body.previewToken,
+         alt_edits: req.body.altEdits, snapshot_timestamp: req.body.snapshotTimestamp };
+-      const scan = () => bridge('scan', { ...page, wcag_review: section.wcagReview, doj_exceptions: section.dojExceptions || [] });
++      const scan = () => bridge('scan', { ...page, rendered: action === 'rendered-scan', wcag_review: section.wcagReview, doj_exceptions: section.dojExceptions || [] });
+       const persistScan = async (result: any) => {
+         await Project.updateOne({ projectID: req.params.projectID, 'a11yReview._id': section._id }, {
+           $set: { 'a11yReview.$.wcagReview': result.wcag_review || result.wcagReview,
+             'a11yReview.$.dojExceptions': result.doj_exceptions || result.dojExceptions || [] },
+         });
+       };
+-      const result = action === 'scan' ? await scan() : await bridge(endpoints[action], body);
+-      let scanResult = action === 'scan' ? result : null;
++      const result = ['scan', 'rendered-scan'].includes(action) ? await scan() : await bridge(endpoints[action], body);
++      let scanResult = ['scan', 'rendered-scan'].includes(action) ? result : null;
+       let scanError: string | undefined;
+       if (action === 'apply' || action === 'restore') {
++        await Project.updateOne({ projectID: req.params.projectID, 'a11yReview._id': section._id }, { $unset: { 'a11yReview.$.wcagReview.rendered': '', 'a11yReview.$.wcagReview.sourceHash': '' } });
+         try { scanResult = await scan(); } catch { scanError = 'The page action completed, but rescan failed. Use Rescan page to retry.'; }
+       }
+       if (scanResult) {
+         try { await persistScan(scanResult); } catch { scanError = 'Scan completed but the matrix could not be saved. Rescan to retry.'; }
+       }
+       let evidenceError: string | undefined;
+-      if (item && ['scan', 'apply', 'restore'].includes(action)) {
++      if (item && ['scan', 'rendered-scan', 'apply', 'restore'].includes(action)) {
+         const criterion = (scanResult?.wcag_review || scanResult?.wcagReview)?.criteria?.find((c: any) => c.id === item.criterionID);
+         const findings = scanResult?.findings?.filter((f: any) => f.ruleId === item.ruleId && (!item.selector || f.selector === item.selector));
+         const evidence = { action, at: new Date(), actor: req.user.decoded.uuid,
+           scannedAt: scanResult?.scanned_at, criterion, findings,
+-          result: action === 'scan' ? undefined : result, scanError };
++          result: ['scan', 'rendered-scan'].includes(action) ? undefined : result, scanError };
+         try {
+           await WorkItems.updateOne({ _id: item._id, projectID: req.params.projectID }, { $push: { scanEvidence: evidence }, $inc: { version: 1 } });
+         } catch { evidenceError = 'Page action completed but task evidence could not be saved. Rescan from this task to retry.'; }
+diff --git a/server/api/remediationqueue.ts b/server/api/remediationqueue.ts
+index 0e60e0f2..4794f8e5 100644
+--- a/server/api/remediationqueue.ts
++++ b/server/api/remediationqueue.ts
+@@ -1,3 +1,4 @@
++import { registerConformance } from './conformance.js';
+ import mongoose from 'mongoose';
+ import { registerRemediationActions } from './remediationactions.js';
+ import { queueCandidates, projectAssignees, validateQueueUpdate, queueStatuses, queuePriorities } from '../util/remediationqueue.js';
+@@ -32,6 +33,7 @@ export function registerRemediationQueue(router: any, { auth, projects, Project,
+     } catch { res.status(500).json({ err: true, errMsg: 'Unable to load the work queue.' }); }
+   };
+   const access = [auth.verifyRequest, auth.getUserAttributes, authorize];
++  registerConformance(router, { base, access });
+   registerRemediationActions(router, { base, access, Project, WorkItems, bridge });
+   router.get(base, ...access, async (req: any, res: any) => {
+     try {
+diff --git a/server/util/conformance-api.test.ts b/server/util/conformance-api.test.ts
+new file mode 100644
+index 00000000..10b2e0d3
+--- /dev/null
++++ b/server/util/conformance-api.test.ts
+@@ -0,0 +1,20 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import express from 'express';
++import { registerConformance } from '../api/conformance.js';
++import { criteria,pageFingerprint } from './conformance.js';
++test('conformance API binds reviewer identity, rejects forged/stale evidence and premature sign-off',async()=>{
++ const records:any[]=[{kind:'scope',data:{version:'scope1',boundaries:'Full reader pages',processes:'Read and navigate'}}],at=new Date().toISOString();
++ const section={_id:'p1',sectionURL:'https://dev.libretexts.org/Sandboxes/johnnyphung/Test',wcagReview:{sourceHash:'a',scannedAt:at,criteria:criteria.map(c=>({...c,status:'pass'})),rendered:{sourceHash:'a',renderedHash:'b',platformHash:'c',scannedAt:at,state:'complete',violations:[]}}};
++ const app=express();app.use(express.json());
++ registerConformance(app,{base:'/q',access:[(req:any,res:any,next:any)=>{if(req.headers['x-user']!=='reviewer')return res.sendStatus(403);req.user={decoded:{uuid:'reviewer'}};req.queueCanEdit=true;req.queueProject={projectID:'demo',a11yReview:[section]};req.params.projectID='demo';next();}],Records:{find:()=>({sort:()=>({lean:async()=>records})}),create:async(r:any)=>records.unshift(r)}});
++ const server=app.listen(0,'127.0.0.1');await new Promise<void>(r=>server.once('listening',r));const base=`http://127.0.0.1:${(server.address() as any).port}/q/conformance`;
++ const post=(action:string,body:any,user='reviewer')=>fetch(`${base}/${action}`,{method:'POST',headers:{'Content-Type':'application/json','x-user':user},body:JSON.stringify(body)});
++ try{
++  assert.equal((await post('review',{},'outsider')).status,403);
++  assert.equal((await post('signoff',{confirmed:true,digest:'forged',statement:'All of the book pages have supposedly passed the review.'})).status,400);
++  const body={sectionID:'p1',criterionID:'1.1.1',fingerprint:pageFingerprint(section),scopeVersion:'scope1',status:'pass',notes:'Compared mathematical meaning with screen reader output and visual content.',environment:'OS / Browser / Screen reader versions',evidenceURLs:[],checks:[0,1],confirmed:true,actor:'forged'};
++  assert.equal((await post('review',{...body,fingerprint:'forged'})).status,400);
++  assert.equal((await post('review',body)).status,200);assert.equal(records[0].actor,'reviewer');assert.equal(records[0].data.actor,undefined);
++ }finally{await new Promise<void>(r=>server.close(()=>r()));}
++});
+diff --git a/server/util/conformance.test.ts b/server/util/conformance.test.ts
+new file mode 100644
+index 00000000..1a61cdb8
+--- /dev/null
++++ b/server/util/conformance.test.ts
+@@ -0,0 +1,28 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { criteria, pageFingerprint, scanBlockers, validateReview, conformanceReport } from './conformance.js';
++const now=Date.now(),at=new Date(now).toISOString(),scope={version:'scope-1',boundaries:'All full reader pages',processes:'Read and navigate the complete book'};
++function section(){return {_id:'page-1',sectionURL:'https://dev.libretexts.org/Sandboxes/johnnyphung/book',wcagReview:{sourceHash:'source',scannedAt:at,criteria:criteria.map(c=>({...c,status:'pass'})),rendered:{state:'complete',sourceHash:'source',renderedHash:'rendered',platformHash:'platform',browser:'chromium',axeVersion:'4',scannedAt:at,violations:[]}}};}
++test('automated 100 percent never establishes verification or sign-off',()=>{
++ const report=conformanceReport({projectID:'book',a11yReview:[section()]},scope,[],[],now);
++ assert.equal(report.totalCriteria,50);assert.equal(report.verifiedCriteria,0);assert.equal(report.readyForSignoff,false);
++ assert.equal(report.status,'verification_pending');
++});
++test('missing pages, source changes, failed loads, stale scans and failures block conformance',()=>{
++ assert.ok(scanBlockers({}).length);
++ for(const mutate of [(s:any)=>s.wcagReview.sourceHash='changed',(s:any)=>s.wcagReview.rendered.state='incomplete',(s:any)=>s.wcagReview.rendered.scannedAt='2020-01-01',(s:any)=>s.wcagReview.criteria[0].status='fail',(s:any)=>s.wcagReview.criteria.pop()]){const s=section();mutate(s);assert.ok(scanBlockers(s,now).length);}
++});
++test('all criteria need evidence bound to current content, platform and scope',()=>{
++ const s=section(),fingerprint=pageFingerprint(s),reviews=criteria.map(c=>({_id:c.id,sectionID:'page-1',criterionID:c.id,status:'pass',fingerprint,scopeVersion:scope.version}));
++ const r=conformanceReport({a11yReview:[s]},scope,reviews,[],now);assert.equal(r.readyForSignoff,true);assert.equal(r.status,'verification_pending');
++ assert.equal(conformanceReport({a11yReview:[s]},scope,reviews,[{digest:r.digest}],now).status,'verified_for_evaluated_scope');
++ s.wcagReview.rendered.platformHash='new css';
++ assert.equal(conformanceReport({a11yReview:[s]},scope,reviews,[{digest:r.digest}],now).verifiedCriteria,0);
++ assert.equal(conformanceReport({a11yReview:[section()]},{...scope,version:'new scope'},reviews,[],now).verifiedCriteria,0);
++ assert.equal(conformanceReport({a11yReview:[section(),{_id:'unscanned'}]},scope,reviews,[],now).readyForSignoff,false);
++});
++test('review validates actual checklists, evidence, N/A rationale and concurrency token',()=>{
++ const s=section(),body={criterionID:'1.1.1',fingerprint:pageFingerprint(s),scopeVersion:scope.version,status:'pass',notes:'Observed the equation with a screen reader and compared its structure.',environment:'NVDA / Windows / Firefox version recorded',evidenceURLs:[],checks:[0,1],confirmed:true};
++ assert.equal(validateReview(body,s,scope).status,'pass');
++ for(const patch of [{checks:[]},{confirmed:false},{notes:'ok'},{fingerprint:'old'},{scopeVersion:'old'},{evidenceURLs:['javascript:alert(1)']},{status:'not_applicable',reason:''}])assert.throws(()=>validateReview({...body,...patch},s,scope));
++});
+diff --git a/server/util/conformance.ts b/server/util/conformance.ts
+new file mode 100644
+index 00000000..1bdc8e14
+--- /dev/null
++++ b/server/util/conformance.ts
+@@ -0,0 +1,60 @@
++import { createHash } from 'node:crypto';
++import criteria from './conformanceCriteria.json';
++export { criteria };
++export const MAX_EVIDENCE_AGE_MS = 24 * 60 * 60 * 1000;
++const hash = (x: unknown) => createHash('sha256').update(JSON.stringify(x)).digest('hex');
++export function pageFingerprint(section: any) {
++  const w = section.wcagReview, r = w?.rendered;
++  if (!w?.sourceHash || r?.sourceHash !== w.sourceHash || !r?.renderedHash || !r?.platformHash) return null;
++  return hash([section.sectionURL,w.sourceHash,r.renderedHash,r.platformHash,r.browser,r.axeVersion]);
++}
++export function scanBlockers(section: any, now = Date.now()) {
++  const w = section.wcagReview, r = w?.rendered, blockers: string[] = [];
++  if (!pageFingerprint(section)) blockers.push('Current source and rendered evidence required.');
++  if (r?.state !== 'complete') blockers.push('Rendered-page scan is missing, failed or incomplete.');
++  if (![r?.scannedAt,w?.scannedAt].every(t=> typeof t === 'string' && Number.isFinite(Date.parse(t)) && Date.parse(t) <= now + 60000 && now-Date.parse(t) <= MAX_EVIDENCE_AGE_MS)) blockers.push('Rescan required: evidence is older than 24 hours or missing.');
++  if (!Array.isArray(w?.criteria) || criteria.some(c=>!w.criteria.some((x:any)=>x.id===c.id))) blockers.push('All 50 WCAG 2.1 A/AA criteria must be present.');
++  if (w?.criteria?.some((c:any)=>c.status==='fail') || r?.violations?.length) blockers.push('Unresolved automated failures.');
++  if (section.remedyError) blockers.push('Latest page scan reported an error.');
++  return blockers;
++}
++export function validateReview(body:any, section:any, scope:any) {
++  const criterion = criteria.find(c=>c.id===body?.criterionID);
++  if (!criterion || !scope?.version) throw Error('Select a criterion and define the evaluation scope first.');
++  const fingerprint=pageFingerprint(section);
++  if (!fingerprint || fingerprint!==body.fingerprint || body.scopeVersion!==scope.version) throw Error('Evidence or scope changed. Refresh before saving.');
++  if (!['pass','fail','not_applicable'].includes(body.status)) throw Error('Choose a review outcome.');
++  if (typeof body.notes!=='string' || body.notes.trim().length<20 || body.notes.length>12000) throw Error('Provide specific review evidence (20–12,000 characters).');
++  if (typeof body.environment!=='string' || body.environment.trim().length<5 || body.environment.length>1000) throw Error('Record browser, operating system, assistive technology and versions.');
++  if (!Array.isArray(body.evidenceURLs) || body.evidenceURLs.length>20 || body.evidenceURLs.some((x:any)=>typeof x!=='string' || x.length>2000 || !/^https:\/\/[^\s]+$/.test(x))) throw Error('Evidence references must be HTTPS URLs (up to 20).');
++  if (body.status==='not_applicable' && (typeof body.reason!=='string' || body.reason.trim().length<20 || body.reason.length>4000)) throw Error('Explain why this criterion does not apply to the full evaluated scope.');
++  if (!Array.isArray(body.checks) || criterion.checklist.some((_,i)=>!body.checks.includes(i)) || body.confirmed!==true) throw Error('Complete the criterion checklist and confirm your review.');
++  if (body.status!=='fail' && scanBlockers(section).length) throw Error('Resolve scan blockers and obtain fresh evidence before passing a criterion.');
++  return {criterionID:criterion.id,status:body.status,notes:body.notes.trim(),environment:body.environment.trim(),
++    evidenceURLs:body.evidenceURLs,reason:body.status==='not_applicable'?body.reason.trim():'',checks:criterion.checklist,
++    fingerprint,scopeVersion:scope.version};
++}
++export function conformanceReport(project:any, scope:any, reviews:any[], signoffs:any[], now=Date.now()) {
++  const sections=project.a11yReview || [];
++  let verified=0;
++  const pages=sections.map((s:any)=>{
++    const fingerprint=pageFingerprint(s), blockers=scanBlockers(s,now);
++    const results=criteria.map(c=>{
++      const candidates=reviews.filter(r=>String(r.sectionID)===String(s._id) && r.criterionID===c.id);
++      const current=candidates.find(r=>r.fingerprint===fingerprint && r.scopeVersion===scope?.version);
++      const status=current ? current.status : candidates.length?'stale':'unreviewed';
++      if (!blockers.length && ['pass','not_applicable'].includes(status)) verified++;
++      return {...c,status,review:current || null};
++    });
++    return {sectionID:String(s._id),title:s.sectionTitle,url:s.sectionURL,fingerprint,blockers,criteria:results,
++      sourceScan:s.wcagReview || null};
++  });
++  const total=sections.length*criteria.length;
++  const ready=Boolean(scope?.version && scope?.processes?.trim() && scope?.boundaries?.trim() && total && verified===total);
++  const digest=hash({scopeVersion:scope?.version,pages:pages.map((p:any)=>[p.sectionID,p.fingerprint,p.criteria.map((c:any)=>String(c.review?._id || ''))])});
++  const signoff=ready ? signoffs.find(s=>s.digest===digest) : null;
++  return {standard:'WCAG 2.1 Level AA',generatedAt:new Date(now).toISOString(),projectID:project.projectID,
++    scope:scope || null,pages,totalCriteria:total,verifiedCriteria:verified,verificationPercent:total?Math.floor(verified/total*100):0,
++    readyForSignoff:ready,status:signoff?'verified_for_evaluated_scope':'verification_pending',signoff:signoff || null,digest,
++    limitations:'Automated checks are not certification. Verification is a dated reviewer assertion for the listed full pages and complete processes. Evidence expires after 24 hours without revalidation; content, rendering or scope changes invalidate reviews. Legal exceptions do not establish WCAG conformance.'};
++}
+diff --git a/server/util/conformanceCriteria.json b/server/util/conformanceCriteria.json
+new file mode 100644
+index 00000000..045f7167
+--- /dev/null
++++ b/server/util/conformanceCriteria.json
+@@ -0,0 +1,452 @@
++[
++  {
++    "id": "1.1.1",
++    "title": "Non-text Content",
++    "level": "A",
++    "checklist": [
++      "Check every image, diagram and mathematical expression against its purpose. Verify math meaning, fractions, exponents and symbol relationships with a screen reader; confirm navigable structure and no duplicate announcements.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.2.1",
++    "title": "Audio-only and Video-only (Prerecorded)",
++    "level": "A",
++    "checklist": [
++      "Compare prerecorded audio-only/video-only content with its equivalent alternative.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.2.2",
++    "title": "Captions (Prerecorded)",
++    "level": "A",
++    "checklist": [
++      "Play prerecorded video and check accurate synchronized captions including speakers and meaningful sounds.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.2.3",
++    "title": "Audio Description or Media Alternative (Prerecorded)",
++    "level": "A",
++    "checklist": [
++      "Check a complete media alternative or audio description conveys all visual information in prerecorded synchronized media.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.2.4",
++    "title": "Captions (Live)",
++    "level": "AA",
++    "checklist": [
++      "Check live synchronized media has accurate live captions.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.2.5",
++    "title": "Audio Description (Prerecorded)",
++    "level": "AA",
++    "checklist": [
++      "Check audio description conveys essential visual information in prerecorded synchronized media.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.3.1",
++    "title": "Info and Relationships",
++    "level": "A",
++    "checklist": [
++      "Inspect headings, lists, tables, forms and math relationships with assistive technology; compare with visual structure.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.3.2",
++    "title": "Meaningful Sequence",
++    "level": "A",
++    "checklist": [
++      "Read the page in programmatic order, including equations and associated explanations.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.3.3",
++    "title": "Sensory Characteristics",
++    "level": "A",
++    "checklist": [
++      "Check instructions do not rely solely on shape, color, size, visual location, orientation or sound.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.3.4",
++    "title": "Orientation",
++    "level": "AA",
++    "checklist": [
++      "Test both portrait and landscape orientations without loss of content or functionality.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.3.5",
++    "title": "Identify Input Purpose",
++    "level": "AA",
++    "checklist": [
++      "Check personal-data inputs expose the correct programmatic input purpose.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.4.1",
++    "title": "Use of Color",
++    "level": "A",
++    "checklist": [
++      "Check color is not the only way information, actions or distinctions are conveyed.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.4.2",
++    "title": "Audio Control",
++    "level": "A",
++    "checklist": [
++      "Check audio that starts automatically for over three seconds can be stopped or independently controlled.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.4.3",
++    "title": "Contrast (Minimum)",
++    "level": "AA",
++    "checklist": [
++      "Check rendered text contrast in all states, including text over images and disabled/exempt cases with rationale.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.4.4",
++    "title": "Resize Text",
++    "level": "AA",
++    "checklist": [
++      "Resize text to 200 percent and check all content and functionality.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.4.5",
++    "title": "Images of Text",
++    "level": "AA",
++    "checklist": [
++      "Check images of text are essential or customizable; use actual text otherwise.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.4.10",
++    "title": "Reflow",
++    "level": "AA",
++    "checklist": [
++      "Test reflow at 320 CSS pixels width and 256 CSS pixels height; document genuinely two-dimensional exceptions.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.4.11",
++    "title": "Non-text Contrast",
++    "level": "AA",
++    "checklist": [
++      "Check contrast of essential UI components, focus indicators and graphical objects in every state.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.4.12",
++    "title": "Text Spacing",
++    "level": "AA",
++    "checklist": [
++      "Apply WCAG text-spacing overrides and inspect for clipping, overlap and loss of functionality.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "1.4.13",
++    "title": "Content on Hover or Focus",
++    "level": "AA",
++    "checklist": [
++      "Test hover/focus content is dismissible, hoverable and persistent where required.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.1.1",
++    "title": "Keyboard",
++    "level": "A",
++    "checklist": [
++      "Complete every action using keyboard only, including math exploration and embedded tools.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.1.2",
++    "title": "No Keyboard Trap",
++    "level": "A",
++    "checklist": [
++      "Enter and leave every component using keyboard; confirm no keyboard traps.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.1.4",
++    "title": "Character Key Shortcuts",
++    "level": "A",
++    "checklist": [
++      "Test single-character shortcuts can be disabled, remapped, or operate only on focus.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.2.1",
++    "title": "Timing Adjustable",
++    "level": "A",
++    "checklist": [
++      "Exercise time limits and verify required adjustment, extension or documented exceptions.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.2.2",
++    "title": "Pause, Stop, Hide",
++    "level": "A",
++    "checklist": [
++      "Check moving, blinking, scrolling and auto-updating content can be paused, stopped or hidden.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.3.1",
++    "title": "Three Flashes or Below Threshold",
++    "level": "A",
++    "checklist": [
++      "Inspect flashing content against the three-flash and general/red flash thresholds.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.4.1",
++    "title": "Bypass Blocks",
++    "level": "A",
++    "checklist": [
++      "Use keyboard and assistive technology to bypass repeated page blocks.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.4.2",
++    "title": "Page Titled",
++    "level": "A",
++    "checklist": [
++      "Check the browser page title identifies topic or purpose.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.4.3",
++    "title": "Focus Order",
++    "level": "A",
++    "checklist": [
++      "Tab through all states and check focus order preserves meaning and operation.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.4.4",
++    "title": "Link Purpose (In Context)",
++    "level": "A",
++    "checklist": [
++      "Read links in context and confirm their purpose and destination are clear.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.4.5",
++    "title": "Multiple Ways",
++    "level": "AA",
++    "checklist": [
++      "Use at least two ways to locate each page unless it is a step in a process.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.4.6",
++    "title": "Headings and Labels",
++    "level": "AA",
++    "checklist": [
++      "Check headings and labels accurately describe topic or purpose.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.4.7",
++    "title": "Focus Visible",
++    "level": "AA",
++    "checklist": [
++      "Test visible keyboard focus on every interactive component.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.5.1",
++    "title": "Pointer Gestures",
++    "level": "A",
++    "checklist": [
++      "Exercise multipoint/path-based gestures and verify a single-pointer alternative.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.5.2",
++    "title": "Pointer Cancellation",
++    "level": "A",
++    "checklist": [
++      "Test pointer cancellation and up-event activation or documented essential exceptions.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.5.3",
++    "title": "Label in Name",
++    "level": "A",
++    "checklist": [
++      "Compare visible control labels with their accessible names, including speech input.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "2.5.4",
++    "title": "Motion Actuation",
++    "level": "A",
++    "checklist": [
++      "Test motion-operated features have UI alternatives and motion can be disabled.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "3.1.1",
++    "title": "Language of Page",
++    "level": "A",
++    "checklist": [
++      "Confirm the programmatically identified page language matches the content.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "3.1.2",
++    "title": "Language of Parts",
++    "level": "AA",
++    "checklist": [
++      "Check language changes are identified for assistive technology, with appropriate exceptions.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "3.2.1",
++    "title": "On Focus",
++    "level": "A",
++    "checklist": [
++      "Focus every control and confirm no unexpected context changes.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "3.2.2",
++    "title": "On Input",
++    "level": "A",
++    "checklist": [
++      "Change inputs and confirm context changes are predictable or announced in advance.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "3.2.3",
++    "title": "Consistent Navigation",
++    "level": "AA",
++    "checklist": [
++      "Compare repeated navigation order across the complete page set and states.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "3.2.4",
++    "title": "Consistent Identification",
++    "level": "AA",
++    "checklist": [
++      "Compare names and identification of repeated components across pages.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "3.3.1",
++    "title": "Error Identification",
++    "level": "A",
++    "checklist": [
++      "Trigger form errors and verify text identifies the item and describes the error.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "3.3.2",
++    "title": "Labels or Instructions",
++    "level": "A",
++    "checklist": [
++      "Check required labels and instructions for every input, including formats and required fields.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "3.3.3",
++    "title": "Error Suggestion",
++    "level": "AA",
++    "checklist": [
++      "Trigger correctable input errors and verify useful suggestions are provided.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "3.3.4",
++    "title": "Error Prevention (Legal, Financial, Data)",
++    "level": "AA",
++    "checklist": [
++      "Test reversal, checking or confirmation for legal, financial and stored-data submissions.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "4.1.1",
++    "title": "Parsing",
++    "level": "A",
++    "checklist": [
++      "Check parsing problems affecting semantics, nesting and identifier associations; inspect source as well as rendered DOM.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "4.1.2",
++    "title": "Name, Role, Value",
++    "level": "A",
++    "checklist": [
++      "Inspect accessible names, roles, values and state changes for all controls and math interactions.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  },
++  {
++    "id": "4.1.3",
++    "title": "Status Messages",
++    "level": "AA",
++    "checklist": [
++      "Trigger status messages and verify screen-reader announcements without unnecessary focus changes.",
++      "Cover the full reader page, embedded content, navigation and all relevant process states; record evidence and limitations."
++    ]
++  }
++]
+diff --git a/server/util/remediationqueue.ts b/server/util/remediationqueue.ts
+index 66454a2e..4c77ab20 100644
+--- a/server/util/remediationqueue.ts
++++ b/server/util/remediationqueue.ts
+@@ -22,8 +22,8 @@ export function queueCandidates(section: any) {
+       result.push({ key, sectionID: String(section._id), pageID: section.pageID || '',
+         sectionTitle: section.sectionTitle, sectionURL: section.sectionURL,
+         criterionID: criterion.id, criterionTitle: criterion.title,
+-        kind: e ? 'finding' : 'manual', ruleId: e?.ruleId || '', selector: e?.selector || '',
+-        title: e?.message || `${criterion.id}: ${criterion.title} — manual verification`,
++        kind: e?.scope === 'full-reader-page' ? 'platform_review' : e ? 'finding' : 'manual', ruleId: e?.ruleId || '', selector: e?.selector || '',
++        title: (e?.scope === 'full-reader-page' ? '[Full page / developer review] ' : '') + (e?.message || `${criterion.id}: ${criterion.title} — manual verification`),
+         evidence: e?.snippet || criterion.applicabilityReason || '',
+         scannedAt: section.wcagReview?.scannedAt || null, fixable: Boolean(e?.fixable) });
+     }

@@ -1,0 +1,218 @@
+From 63d9fad953ce4c26b433b98fee261c6ccba764e0 Mon Sep 17 00:00:00 2001
+From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 23:03:09 -0700
+Subject: [PATCH 10/12] feat: separate remediation handoff acceptance from WCAG
+ verification
+
+(cherry picked from commit 01aad7ff0d8c2e8816c0233a5eb339f1dddd133d)
+---
+ .../components/projects/ConformanceReview.tsx | 26 ++++++++++--
+ docs/accessibility-verification.md            |  6 +++
+ server/api/conformance.ts                     |  7 +++-
+ server/util/conformance-api.test.ts           | 10 +++++
+ server/util/remediationHandoff.test.ts        | 32 +++++++++++++++
+ server/util/remediationHandoff.ts             | 40 +++++++++++++++++++
+ 6 files changed, 117 insertions(+), 4 deletions(-)
+ create mode 100644 server/util/remediationHandoff.test.ts
+ create mode 100644 server/util/remediationHandoff.ts
+
+diff --git a/client/src/components/projects/ConformanceReview.tsx b/client/src/components/projects/ConformanceReview.tsx
+index cbed55bf..27543b2a 100644
+--- a/client/src/components/projects/ConformanceReview.tsx
++++ b/client/src/components/projects/ConformanceReview.tsx
+@@ -19,6 +19,25 @@ function ReviewForm({page,criterion,scope,save,busy}:any) {
+     <button className="ui primary button" disabled={busy || !scope || !confirmed}>Save reviewer evidence</button>
+   </form>;
+ }
++function HandoffSignoff({handoff,canEdit,save,busy}:any) {
++  const [statement,setStatement]=useState(''),[confirmed,setConfirmed]=useState(false),[deferredConfirmed,setDeferredConfirmed]=useState(false);
++  if(!handoff)return null;
++  return <section aria-label="Remediation handoff" className="ui segment">
++    <h3>Remediation handoff</h3>
++    <p><strong>{handoff.status==='accepted_for_remediation_handoff'?'Delivery accepted':handoff.status==='acceptance_stale'?'Acceptance needs renewal':handoff.readyForSignoff?'Ready for delivery acceptance':'Source evidence required'}</strong></p>
++    <p>Accept the current remediation delivery while reader accessibility and human testing continue as independent projects. Outstanding findings remain open. This sign-off does not certify WCAG conformance.</p>
++    <ul>{handoff.deferredWork.map((work:any)=><li key={work.id}><strong>{work.title}:</strong> {work.scope}</li>)}</ul>
++    <p>Outstanding evidence: {handoff.outstanding.failedPageCriteria} failed page criteria; {handoff.outstanding.readerPagesNeedingFollowup} reader pages need follow-up; {handoff.outstanding.unverifiedPageCriteria} page criteria await verification.</p>
++    {handoff.blockers.length>0 && <ul>{handoff.blockers.map((b:string)=><li key={b}>{b}</li>)}</ul>}
++    {handoff.signoff && <p>Accepted by {handoff.signoff.actor} on {new Date(handoff.signoff.at).toLocaleString()}: {handoff.signoff.statement}</p>}
++    {canEdit && !handoff.signoff && <form onSubmit={e=>{e.preventDefault();save('remediation_signoff',{digest:handoff.digest,statement,confirmed,deferredConfirmed});}}>
++      <label>Delivery acceptance statement<textarea required minLength={40} maxLength={4000} value={statement} onChange={e=>setStatement(e.target.value)}/></label>
++      <label><input type="checkbox" checked={deferredConfirmed} onChange={e=>setDeferredConfirmed(e.target.checked)}/> Reader accessibility and human screen-reader/keyboard reviews are deferred to independent projects.</label>
++      <label><input type="checkbox" checked={confirmed} onChange={e=>setConfirmed(e.target.checked)}/> I accept this remediation delivery with the outstanding findings listed above. This is not a WCAG conformance sign-off.</label>
++      <button className="ui primary button" disabled={busy || !handoff.readyForSignoff || !confirmed || !deferredConfirmed}>Sign remediation handoff</button>
++    </form>}
++  </section>;
++}
+ export default function ConformanceReview({projectID,sections,onScanSaved}:any) {
+   const [data,setData]=useState<any>(null),[error,setError]=useState(''),[message,setMessage]=useState(''),[busy,setBusy]=useState(false),[sectionID,setSectionID]=useState(''),[criterionID,setCriterionID]=useState('1.1.1');
+   const [boundaries,setBoundaries]=useState(''),[processes,setProcesses]=useState(''),[platformVersion,setPlatformVersion]=useState(''),[scopeConfirmed,setScopeConfirmed]=useState(false),[statement,setStatement]=useState(''),[signed,setSigned]=useState(false);
+@@ -26,18 +45,19 @@ export default function ConformanceReview({projectID,sections,onScanSaved}:any)
+   const base=`/project/${encodeURIComponent(projectID)}/accessibility/workqueue`;
+   async function load(){const n=++generation.current;const d=await request(`${base}/conformance`);if(n===generation.current)setData(d);}
+   useEffect(()=>{load().catch(e=>setError(e.message));return()=>{generation.current++;stop.current=true;};},[projectID,sections]);
+-  async function save(action:string,body:any){setBusy(true);setError('');try{await request(`${base}/conformance/${action}`,body);await load();setMessage('Review record saved.');}catch(e:any){setError(e.message);}finally{setBusy(false);}}
++  async function save(action:string,body:any){setBusy(true);setError('');try{await request(`${base}/conformance/${action}`,body);await load();setMessage(action==='remediation_signoff'?'Remediation delivery accepted. Deferred projects remain open.':'Review record saved.');}catch(e:any){setError(e.message);}finally{setBusy(false);}}
+   async function scan(all=false){setBusy(true);setError('');stop.current=false;const pages=all?data.report.pages:data.report.pages.filter((p:any)=>p.sectionID===sectionID);let count=0,failures=0;
+     try{for(const p of pages){if(stop.current)break;setMessage(`Scanning rendered page ${count+1}/${pages.length}: ${p.title}`);try{const r=await request(`${base}/page/${p.sectionID}/rendered-scan`,{});if(r.scanError || r.wcag_review?.rendered?.state!=='complete')failures++;}catch{failures++;}count++;}await load();onScanSaved?.();setMessage(`${count} rendered pages scanned; ${failures} require scan follow-up. Reviewer verification remains pending.`);}catch(e:any){setError(e.message);}finally{setBusy(false);}}
+   const report=data?.report,page=report?.pages.find((p:any)=>p.sectionID===sectionID),criterion=page?.criteria.find((c:any)=>c.id===criterionID);
+ 
+   return <section className="ui segment conformance-review" aria-label="WCAG verification">
+     <style>{`.conformance-review label{display:block;margin:.8rem 0}.conformance-review textarea,.conformance-review select,.conformance-review input:not([type=checkbox]){display:block;width:100%;max-width:100%;padding:.5rem;border:1px solid #777;border-radius:4px}.conformance-review details{margin:1rem 0}.conformance-review summary{cursor:pointer;font-weight:600}.conformance-review :focus-visible{outline:3px solid #1565c0;outline-offset:2px}.conformance-review pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto}`}</style>
+-    <h2>WCAG verification</h2>
++    <h2>Remediation acceptance and WCAG verification</h2>
+     {error && <p role="alert" className="ui negative message">{error}</p>}<p role="status">{message}</p>
+     {!report?<p>Loading verification evidence…</p>:<>
++      <HandoffSignoff key={report.remediationHandoff?.digest} handoff={report.remediationHandoff} canEdit={data.canEdit} save={save} busy={busy}/>
+       <p><strong>Verification progress: {report.verificationPercent}%</strong> ({report.verifiedCriteria}/{report.totalCriteria} page criteria). <strong>Conformance: {report.status==='verified_for_evaluated_scope'?'Verified for evaluated scope':'Verification pending'}</strong></p>
+-      <p>Full reader pages, navigation, embedded content and complete processes are in scope. Source scans and browser scans do not replace human review. Changes invalidate matching evidence; scans must be refreshed within 24 hours for sign-off.</p>
++      <p>Full reader pages, navigation, embedded content and complete processes are in scope. Source scans and browser scans do not replace human review. Changes invalidate matching evidence; scans must be refreshed within 24 hours for WCAG conformance sign-off.</p>
+       <button className="ui button" onClick={()=>load().catch(e=>setError(e.message))} disabled={busy}>Refresh verification</button><a className="ui button" href={`/api/v1${base}/conformance/report`} download>Export evaluation report</a>
+       <details><summary>Evaluation scope {report.scope?'— defined':'— required'}</summary>
+         {report.scope && <p>Current scope: {report.scope.boundaries}<br/>Processes: {report.scope.processes}<br/>Platform: {report.scope.platformVersion}</p>}
+diff --git a/docs/accessibility-verification.md b/docs/accessibility-verification.md
+index c7338498..e07e1462 100644
+--- a/docs/accessibility-verification.md
++++ b/docs/accessibility-verification.md
+@@ -11,3 +11,9 @@ Rendered scans run through `/page/:sectionID/rendered-scan`, which resolves the
+ A reviewer can sign only after all criteria for all listed pages are current and verified. The statement binds to a digest of scope, page fingerprints and review records. Scope/content/rendering changes invalidate it. Exported reports are dated evidence snapshots, not promises about future content or a third-party certification. Changes outside the application are detected on rescan; scan freshness limits this gap.
+ 
+ Human tests must cover mathematical meaning and navigability, duplicate announcements, keyboard interaction, zoom/reflow/text spacing, media and complex images, linguistic accuracy, and the complete reader processes defined in scope. Never auto-populate these results from AI inference or axe checks.
++
++## Remediation delivery acceptance
++
++The panel also supports a separate remediation handoff sign-off. `POST /conformance/remediation_signoff` accepts the current delivery with outstanding findings explicitly retained. Shared reader accessibility and human screen-reader/keyboard/manual testing are listed as independent deferred projects. These do not block delivery acceptance. This record never changes WCAG results, verifies queue tasks, or claims accessibility conformance.
++
++Delivery acceptance requires a defined scope, current source scans for all listed pages, a statement and explicit acknowledgement of the deferred work. The server binds the authenticated actor, evidence digest, outstanding counts and fixed deferred scope; clients cannot erase those disclosures. Content, scope and evidence changes invalidate matching acceptance, and source scan freshness is 24 hours. The combined export includes both delivery acceptance and the independent conformance status.
+diff --git a/server/api/conformance.ts b/server/api/conformance.ts
+index 4b65372c..3bc60160 100644
+--- a/server/api/conformance.ts
++++ b/server/api/conformance.ts
+@@ -1,3 +1,4 @@
++import { remediationHandoff, validateRemediationHandoff } from '../util/remediationHandoff.js';
+ import mongoose from 'mongoose';
+ import { randomUUID } from 'node:crypto';
+ import { criteria, conformanceReport, validateReview } from '../util/conformance.js';
+@@ -11,7 +12,9 @@ export function registerConformance(router:any,{base,access,Records=Record}:any)
+     const scope=records.find((r:any)=>r.kind==='scope')?.data;
+     const reviews=records.filter((r:any)=>r.kind==='review').map((r:any)=>({...r.data,_id:r._id,sectionID:r.sectionID,actor:r.actor,at:r.at}));
+     const signoffs=records.filter((r:any)=>r.kind==='signoff').map((r:any)=>({...r.data,actor:r.actor,at:r.at}));
+-    return {scope,report:conformanceReport(project,scope,reviews,signoffs)};
++    const report=conformanceReport(project,scope,reviews,signoffs);
++    const handoffs=records.filter((r:any)=>r.kind==='remediation_signoff').map((r:any)=>({...r.data,actor:r.actor,at:r.at}));
++    return {scope,report:{...report,remediationHandoff:remediationHandoff(report,handoffs)}};
+   };
+   router.get(`${base}/conformance`,...access,async(req:any,res:any)=>{
+     try {const {report}=await load(req.queueProject);res.json({err:false,canEdit:req.queueCanEdit,criteria,report});}
+@@ -36,6 +39,8 @@ export function registerConformance(router:any,{base,access,Records=Record}:any)
+         const section=(req.queueProject.a11yReview || []).find((s:any)=>String(s._id)===body.sectionID);
+         if(!section) throw Error('Page is not in this project.');
+         data=validateReview(body,section,scope);sectionID=body.sectionID;criterionID=data.criterionID;
++      } else if(kind==='remediation_signoff') {
++        data=validateRemediationHandoff(body,report.remediationHandoff);
+       } else if(kind==='signoff') {
+         if(!report.readyForSignoff || report.digest!==body.digest) throw Error('All pages and criteria require current verified evidence before sign-off.');
+         if(body.confirmed!==true || typeof body.statement!=='string' || body.statement.trim().length<40 || body.statement.length>4000) throw Error('Provide and confirm a reviewer conformance statement (40–4,000 characters).');
+diff --git a/server/util/conformance-api.test.ts b/server/util/conformance-api.test.ts
+index 1124c42a..60f32001 100644
+--- a/server/util/conformance-api.test.ts
++++ b/server/util/conformance-api.test.ts
+@@ -17,5 +17,15 @@ test('conformance API binds reviewer identity, rejects forged/stale evidence and
+   const body={sectionID:'p1',criterionID:'1.1.1',fingerprint:pageFingerprint(section),scopeVersion:'scope1',status:'pass',notes:'Compared mathematical meaning with screen reader output and visual content.',environment:'OS / Browser / Screen reader versions',evidenceURLs:[],checks:[0,1],confirmed:true,actor:'forged'};
+   assert.equal((await post('review',{...body,fingerprint:'forged'})).status,400);
+   assert.equal((await post('review',body)).status,200);assert.equal(records[0].actor,'reviewer');assert.equal(records[0].data.actor,undefined);
++  const before=await (await fetch(base,{headers:{'x-user':'reviewer'}})).json();
++  const delivery={digest:before.report.remediationHandoff.digest,confirmed:true,deferredConfirmed:true,statement:'Accept the remediation delivery while reader and human testing continue independently.',actor:'forged',deferredWork:[]};
++  assert.equal((await post('remediation_signoff',delivery,'outsider')).status,403);
++  assert.equal((await post('remediation_signoff',{...delivery,deferredConfirmed:false})).status,400);
++  assert.equal((await post('remediation_signoff',delivery)).status,200);
++  assert.equal(records[0].kind,'remediation_signoff');assert.equal(records[0].actor,'reviewer');assert.equal(records[0].data.deferredWork.length,2);
++  const after=await (await fetch(`${base}/report`,{headers:{'x-user':'reviewer'}})).json();
++  assert.equal(after.remediationHandoff.status,'accepted_for_remediation_handoff');assert.equal(after.status,'verification_pending');
++  assert.equal((await post('signoff',{confirmed:true,digest:after.digest,statement:delivery.statement})).status,400);
++
+  }finally{await new Promise<void>(r=>server.close(()=>r()));}
+ });
+diff --git a/server/util/remediationHandoff.test.ts b/server/util/remediationHandoff.test.ts
+new file mode 100644
+index 00000000..17b7a43c
+--- /dev/null
++++ b/server/util/remediationHandoff.test.ts
+@@ -0,0 +1,32 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { conformanceReport, criteria } from './conformance.js';
++import { remediationHandoff, validateRemediationHandoff } from './remediationHandoff.js';
++const now = Date.now(), at = new Date(now).toISOString();
++function evaluation() {
++  return conformanceReport({a11yReview:[{_id:'one',sectionURL:'https://dev.libretexts.org/Sandboxes/johnnyphung/book',wcagReview:{sourceHash:'v1',scannedAt:at,criteria:criteria.map(c=>({...c,status:'fail'})),rendered:{state:'incomplete',sourceHash:'v1',renderedHash:'r1',platformHash:'p1',scannedAt:at,violations:[{id:'link-name'}]}}}]},{version:'scope',boundaries:'Full pages',processes:'Reader navigation'},[],[],now);
++}
++test('delivery acceptance permits deferred reader failures and human reviews without establishing conformance',()=>{
++ const report=evaluation(),handoff=remediationHandoff(report,[],now);
++ assert.equal(handoff.readyForSignoff,true);assert.equal(report.readyForSignoff,false);
++ assert.deepEqual(handoff.outstanding,{failedPageCriteria:50,readerPagesNeedingFollowup:1,unverifiedPageCriteria:50});
++ const body={digest:handoff.digest,confirmed:true,deferredConfirmed:true,statement:'Accept the current delivery; reader and human accessibility work remains deferred.'};
++ const saved=validateRemediationHandoff(body,handoff);
++ assert.equal(remediationHandoff(report,[saved],now).status,'accepted_for_remediation_handoff');
++ assert.equal(report.status,'verification_pending');assert.equal(report.verifiedCriteria,0);
++ assert.equal(saved.deferredWork.length,2);
++});
++test('missing scope, missing source evidence and stale source scans still prevent delivery acceptance',()=>{
++ for(const mutate of [(r:any)=>r.scope=null,(r:any)=>r.pages=[],(r:any)=>delete r.pages[0].sourceScan.sourceHash,(r:any)=>r.pages[0].sourceScan.scannedAt='2020-01-01',(r:any)=>r.pages[0].sourceScan.scannedAt=new Date(now+120000).toISOString()]){
++  const r=evaluation();mutate(r);assert.equal(remediationHandoff(r,[],now).readyForSignoff,false);
++ }
++});
++test('changed delivery or evidence invalidates acceptance and forged fields cannot replace deferred work',()=>{
++ const report=evaluation(),handoff=remediationHandoff(report,[],now),body={digest:handoff.digest,statement:'Accept the current delivery with unresolved accessibility work recorded.',confirmed:true,deferredConfirmed:true};
++ for(const patch of [{digest:'old'},{confirmed:false},{deferredConfirmed:false},{statement:'ok'}])assert.throws(()=>validateRemediationHandoff({...body,...patch},handoff));
++ const saved=validateRemediationHandoff({...body,deferredWork:[],outstanding:{},actor:'forged'},handoff);
++ assert.equal(saved.deferredWork.length,2);assert.equal((saved as any).actor,undefined);
++ for(const mutate of [(r:any)=>r.digest='new-scope-or-rendering',(r:any)=>r.pages[0].sourceScan.sourceHash='v2',(r:any)=>r.pages[0].sourceScan.scannedAt=new Date(now+1).toISOString(),(r:any)=>r.pages[0].sourceScan.criteria[0].status='pass']){
++  const r=evaluation();mutate(r);assert.equal(remediationHandoff(r,[saved],now).status,'acceptance_stale');
++ }
++});
+diff --git a/server/util/remediationHandoff.ts b/server/util/remediationHandoff.ts
+new file mode 100644
+index 00000000..9194ae96
+--- /dev/null
++++ b/server/util/remediationHandoff.ts
+@@ -0,0 +1,40 @@
++import { createHash } from 'node:crypto';
++import { MAX_EVIDENCE_AGE_MS } from './conformance.js';
++
++export const deferredWork = [
++  { id: 'reader', title: 'Reader accessibility', scope: 'Shared reader navigation, styling, integrations, embedded services and resource-load issues.' },
++  { id: 'human-testing', title: 'Human accessibility testing', scope: 'Screen-reader math reading and exploration, keyboard operation and the remaining manual WCAG criterion reviews.' },
++];
++
++/** Delivery acceptance is independent of WCAG conformance and never changes criterion results. */
++export function remediationHandoff(report: any, signoffs: any[], now = Date.now()) {
++  const blockers: string[] = [];
++  if (!report.scope?.version) blockers.push('Define the evaluation scope before accepting the remediation handoff.');
++  if (!report.pages.length) blockers.push('Add pages and scan the remediation delivery.');
++  const missing = report.pages.filter((p: any) => {
++    const w = p.sourceScan, scanned = Date.parse(w?.scannedAt);
++    return !w?.sourceHash || !Number.isFinite(scanned) || scanned > now + 60000 || now - scanned > MAX_EVIDENCE_AGE_MS;
++  });
++  if (missing.length) blockers.push(`${missing.length} pages require a current source scan before delivery acceptance.`);
++  const outstanding = {
++    failedPageCriteria: report.pages.reduce((n: number, p: any) => n + (p.sourceScan?.criteria || []).filter((c: any) => c.status === 'fail').length, 0),
++    readerPagesNeedingFollowup: report.pages.filter((p: any) => p.sourceScan?.rendered?.state !== 'complete' || p.sourceScan?.rendered?.violations?.length).length,
++    unverifiedPageCriteria: report.totalCriteria - report.verifiedCriteria,
++  };
++  const digest = createHash('sha256').update(JSON.stringify({
++    purpose: 'remediation-handoff-v1', evaluationDigest: report.digest, deferredWork, outstanding,
++    pages: report.pages.map((p: any) => [p.sectionID, p.url, p.sourceScan?.sourceHash, p.sourceScan?.scannedAt, p.sourceScan?.rendered?.scannedAt]),
++  })).digest('hex');
++  const signoff = !blockers.length ? signoffs.find(s => s.digest === digest) || null : null;
++  return { status: signoff ? 'accepted_for_remediation_handoff' : signoffs.length ? 'acceptance_stale' : 'awaiting_acceptance',
++    readyForSignoff: !blockers.length, blockers, digest, deferredWork, outstanding, signoff,
++    limitations: 'Accepts the current remediation delivery with the listed outstanding findings and deferred projects. Does not verify WCAG conformance or complete human accessibility testing. New evidence, scope or content changes require renewed acceptance.' };
++}
++
++export function validateRemediationHandoff(body: any, handoff: any) {
++  if (!handoff.readyForSignoff || body?.digest !== handoff.digest) throw Error('Delivery evidence changed or source scans are missing. Refresh before signing.');
++  if (body.confirmed !== true || body.deferredConfirmed !== true) throw Error('Confirm delivery acceptance and the deferred reader and human-testing projects.');
++  if (typeof body.statement !== 'string' || body.statement.trim().length < 40 || body.statement.length > 4000) throw Error('Provide a delivery acceptance statement (40–4,000 characters).');
++  return { digest: handoff.digest, statement: body.statement.trim(), deferredWork: handoff.deferredWork,
++    outstanding: handoff.outstanding, limitations: handoff.limitations };
++}

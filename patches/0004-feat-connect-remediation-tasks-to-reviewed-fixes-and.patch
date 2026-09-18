@@ -1,0 +1,712 @@
+From 60713b334104f7e21cbe10c6001e30c076fc8413 Mon Sep 17 00:00:00 2001
+From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 10:52:28 -0700
+Subject: [PATCH 04/12] feat: connect remediation tasks to reviewed fixes and
+ recovery
+
+(cherry picked from commit 22caa14ae745bc47528322be4f167016939485ba)
+---
+ .../projects/ProjectAccessibility.jsx         |  2 +
+ .../projects/RemediationPageActions.tsx       | 97 +++++++++++++++++++
+ .../projects/RemediationWorkQueue.tsx         | 87 +++++++++++++++++
+ client/src/remediation-queue-entry.tsx        | 26 +++++
+ docs/remediation-integration.md               | 48 +++++++++
+ server/api.js                                 |  5 +
+ server/api/remediationactions.ts              | 67 +++++++++++++
+ server/api/remediationqueue.ts                | 81 ++++++++++++++++
+ server/util/remediationactions.test.ts        | 46 +++++++++
+ server/util/remediationqueue.test.ts          | 91 +++++++++++++++++
+ server/util/remediationqueue.ts               | 42 ++++++++
+ 11 files changed, 592 insertions(+)
+ create mode 100644 client/src/components/projects/RemediationPageActions.tsx
+ create mode 100644 client/src/components/projects/RemediationWorkQueue.tsx
+ create mode 100644 client/src/remediation-queue-entry.tsx
+ create mode 100644 docs/remediation-integration.md
+ create mode 100644 server/api/remediationactions.ts
+ create mode 100644 server/api/remediationqueue.ts
+ create mode 100644 server/util/remediationactions.test.ts
+ create mode 100644 server/util/remediationqueue.test.ts
+ create mode 100644 server/util/remediationqueue.ts
+
+diff --git a/client/src/components/projects/ProjectAccessibility.jsx b/client/src/components/projects/ProjectAccessibility.jsx
+index 78be2275..6dd41339 100644
+--- a/client/src/components/projects/ProjectAccessibility.jsx
++++ b/client/src/components/projects/ProjectAccessibility.jsx
+@@ -40,6 +40,7 @@ import {
+ import useGlobalError from '../error/ErrorHooks';
+ import api from '../../api';
+ import { computeA11yScore, computeWcagProjectSummary } from './accessibilityScore';
++import RemediationWorkQueue from './RemediationWorkQueue';
+ 
+ const SUPPORTED_SCAN_KEYS = [
+     'imgAltText',
+@@ -1557,6 +1558,7 @@ const ProjectAccessibility = (props) => {
+                                                     }
+                                                 </div>
+                                             </Segment>
++                                            <RemediationWorkQueue projectID={props.match.params.id} />
+                                             <WcagReviewTable
+                                                 sections={reviewSections}
+                                                 getSectionFixableIssueCount={getSectionFixableIssueCount}
+diff --git a/client/src/components/projects/RemediationPageActions.tsx b/client/src/components/projects/RemediationPageActions.tsx
+new file mode 100644
+index 00000000..9a523b3a
+--- /dev/null
++++ b/client/src/components/projects/RemediationPageActions.tsx
+@@ -0,0 +1,97 @@
++import React, { useState } from 'react';
++
++export default function RemediationPageActions({ base, section, item, request, refreshed, close }: any) {
++  const [scan, setScan] = useState<any>(null);
++  const [selected, setSelected] = useState<string[]>([]);
++  const [mode, setMode] = useState('deterministic');
++  const [preview, setPreview] = useState<any>(null);
++  const [snapshots, setSnapshots] = useState<any[]>([]);
++  const [snapshot, setSnapshot] = useState('');
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState('');
++  const [message, setMessage] = useState('');
++  const [reviewed, setReviewed] = useState(false);
++  const [altEdits, setAltEdits] = useState<Record<string, string>>({});
++  const [lastSnapshot, setLastSnapshot] = useState('');
++  const invalidate = () => { setPreview(null); setReviewed(false); setAltEdits({}); };
++  const call = (action: string, body: any = {}) => request(`${base}/page/${encodeURIComponent(section.id)}/${action}`, 'POST', { ...body, itemID: item?._id });
++  const selectFindings = (result: any) => {
++    setScan(result);
++    const matches = (result.findings || []).filter((f: any) => f.fixable && item && f.ruleId === item.ruleId && (!item.selector || f.selector === item.selector));
++    setSelected(matches.map((f: any) => f.id));
++  };
++  async function act(action: string) {
++    setBusy(true); setError(''); setMessage('');
++    try {
++      if (action === 'scan') {
++        invalidate(); const result = await call('scan'); selectFindings(result);
++        setMessage(result.scanError || result.evidenceError || 'Rescan complete. Evidence attached to the task; reviewer verification is still required.');
++      } else if (action === 'snapshots') {
++        invalidate(); const result = await call('snapshots'); setSnapshots(result.snapshots || []); setSnapshot('');
++        setMessage(result.snapshots?.length ? 'Choose a saved version and preview the restoration.' : 'No saved versions for this page.');
++      } else if (action === 'revise-preview') {
++        const result = await call('revise-preview', { previewToken: preview.preview_token, altEdits: Object.entries(altEdits).map(([src, text]) => ({ src, text })) });
++        setReviewed(false); setAltEdits({}); setPreview({ ...result, kind: 'apply' });
++        setMessage('Description updated. Review the revised preview before applying.');
++      } else if (action === 'preview' || action === 'restore-preview') {
++        invalidate(); const result = await call(action, { findingIDs: selected, fixMode: mode === 'deterministic' ? mode : 'pipeline', tier: mode === 'advanced' ? 3 : 2, snapshotTimestamp: snapshot });
++        setAltEdits({}); setPreview({ ...result, kind: action === 'preview' ? 'apply' : 'restore' });
++      } else {
++        const result = await call(action, { findingIDs: selected, fixMode: mode === 'deterministic' ? mode : 'pipeline', previewHash: preview.preview_hash, previewToken: preview.preview_token });
++        invalidate(); if (result.scan) selectFindings(result.scan);
++        if (result.snapshot_path) setLastSnapshot(result.snapshot_path.split('/').pop());
++        setMessage(`${action === 'apply' ? 'Apply' : 'Restore'} completed. ${result.scanError || result.evidenceError || 'Rescan complete; evidence attached. Final verification remains with the reviewer.'}`);
++      }
++      await refreshed();
++    } catch (e: any) { setError(e.message); if (action === 'apply' || action === 'restore') invalidate(); }
++    finally { setBusy(false); }
++  }
++  const images: any[] = [];
++  if (preview?.before_html && preview.kind === 'apply') {
++    const before = new DOMParser().parseFromString(preview.before_html, 'text/html');
++    const after = new DOMParser().parseFromString(preview.after_html, 'text/html');
++    for (const finding of (scan?.findings || []).filter((f: any) => selected.includes(f.id))) {
++      try {
++        const findImage = (doc: Document) => finding.data?.src ? Array.from(doc.querySelectorAll('img')).find(img => img.getAttribute('src') === finding.data.src) : doc.querySelector(finding.selector);
++        const original = findImage(before), changed = findImage(after);
++        if (original?.tagName !== 'IMG' || !changed) continue;
++        const src = new URL(original.getAttribute('src') || '', scan.page_url).href;
++        if (src.startsWith('https:')) images.push({ src, source: original.getAttribute('src'), before: original.getAttribute('alt'), after: changed.getAttribute('alt') });
++      } catch { /* Full HTML remains available if a scanner selector cannot be resolved. */ }
++    }
++  }
++  return <section aria-label="Page remediation" className="ui segment">
++    <h3>Remediate: {section.title}</h3>
++    {item && <p>Task: {item.title}</p>}
++    <p>Preview changes, review the result, then apply. Apply and restore both rescan the page. Restore replaces the full page body with the selected saved version.</p>
++    {error && <div role="alert" className="ui negative message">{error}</div>}
++    <div role="status">{busy ? 'Working…' : message}</div>
++    {message && <p><button type="button" className="ui button" disabled={busy} onClick={() => window.location.reload()}>Reload matrix from saved scan</button></p>}
++    {lastSnapshot && <p>Recovery snapshot saved: <code>{lastSnapshot}</code></p>}
++    <div className="rq-fields">
++      <button type="button" className="ui button" disabled={busy} onClick={() => act('scan')}>Rescan page</button>
++      <button type="button" className="ui button" disabled={busy} onClick={() => act('snapshots')}>Restore saved version</button>
++      <button type="button" className="ui button" disabled={busy} onClick={close}>Close page actions</button>
++    </div>
++    {scan && <>
++      <p>Latest scan: {scan.scanned_at}. {scan.findings?.length || 0} findings. {item && !selected.length && 'The task finding is not currently selected; inspect the results before proceeding.'}</p>
++      <label>Remediation mode<select value={mode} disabled={busy} onChange={e => { setMode(e.target.value); invalidate(); }}>
++        <option value="deterministic">Selected findings</option><option value="ai">AI page review (Tier 2)</option><option value="advanced">Advanced AI page review (Tier 3)</option>
++      </select></label>
++      {mode !== 'deterministic' && <p>This mode previews changes across the entire page. Review all changes before applying.</p>}
++      <div className="rq-candidates">{(scan.findings || []).map((f: any) => <label key={f.id}><input type="checkbox" disabled={busy || !f.fixable || mode !== 'deterministic'} checked={selected.includes(f.id)} onChange={e => { setSelected(prev => e.target.checked ? [...prev, f.id] : prev.filter(x => x !== f.id)); invalidate(); }} />{f.message}{!f.fixable && ' (manual review)'}</label>)}</div>
++      <button type="button" className="ui primary button" disabled={busy || (mode === 'deterministic' && !selected.length)} onClick={() => act('preview')}>Preview selected fix</button>
++    </>}
++    {!!snapshots.length && <div className="ui segment"><label>Saved version<select disabled={busy} value={snapshot} onChange={e => { setSnapshot(e.target.value); invalidate(); }}><option value="">Choose a saved version</option>{snapshots.map(s => <option key={s.timestamp} value={s.timestamp}>{s.timestamp} — {s.summary} — {s.hash}</option>)}</select></label><button className="ui button" disabled={busy || !snapshot} onClick={() => act('restore-preview')}>Preview restore</button></div>}
++    {preview && <div className="ui segment">
++      <h4>{preview.kind === 'restore' ? 'Restore preview' : 'Fix preview'}</h4>
++      {images.map((i, n) => <figure key={n}><img src={i.src} alt="Source image being reviewed for its proposed description" style={{ maxWidth: '100%', maxHeight: 360 }} /><figcaption><p>Current alt text: {i.before || '(empty)'}</p><p><strong>Proposed alt text:</strong> {i.after || '(empty)'}</p></figcaption>{mode === 'deterministic' && <label>Edit proposed alt text<textarea maxLength={150} value={altEdits[i.source] ?? i.after ?? ''} disabled={busy} onChange={e => { setAltEdits(prev => ({ ...prev, [i.source]: e.target.value })); setReviewed(false); }} /></label>}</figure>)}
++      {!!Object.keys(altEdits).length && <button className="ui button" disabled={busy} onClick={() => act('revise-preview')}>Update reviewed description</button>}
++      {preview.diff && <pre className="rq-evidence" style={{ maxHeight: 360 }}>{preview.diff}</pre>}
++      <details><summary>Compare full page HTML</summary><h5>Current HTML</h5><pre className="rq-evidence">{preview.before_html}</pre><h5>Proposed HTML</h5><pre className="rq-evidence">{preview.after_html}</pre></details>
++      {(preview.fix_errors || []).length > 0 && <p>Some fixes failed: {JSON.stringify(preview.fix_errors)}</p>}
++      <label><input type="checkbox" checked={reviewed} disabled={busy} onChange={e => setReviewed(e.target.checked)} /> I reviewed this preview and want to {preview.kind === 'restore' ? 'restore this saved version' : 'apply these changes'}.</label>
++      <button className="ui primary button" disabled={busy || !!Object.keys(altEdits).length || !reviewed || preview.before_html === preview.after_html} onClick={() => act(preview.kind)}>{preview.kind === 'restore' ? 'Confirm restore and rescan' : 'Apply reviewed fix and rescan'}</button>
++    </div>}
++  </section>;
++}
+diff --git a/client/src/components/projects/RemediationWorkQueue.tsx b/client/src/components/projects/RemediationWorkQueue.tsx
+new file mode 100644
+index 00000000..ee025847
+--- /dev/null
++++ b/client/src/components/projects/RemediationWorkQueue.tsx
+@@ -0,0 +1,87 @@
++import RemediationPageActions from './RemediationPageActions';
++import React, { useEffect, useRef, useState } from 'react';
++
++const statuses = { todo: 'To do', in_progress: 'In progress', needs_review: 'Needs review', verified: 'Verified', blocked: 'Blocked' };
++const priorities = ['low', 'normal', 'high', 'urgent'];
++const label = (s: string) => statuses[s as keyof typeof statuses] || s;
++
++async function request(path: string, method = 'GET', body?: unknown) {
++  const res = await fetch(`/api/v1${path}`, { method, credentials: 'same-origin',
++    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
++    ...(body ? { body: JSON.stringify(body) } : {}) });
++  const data = await res.json();
++  if (!res.ok || data.err) throw Error(data.errMsg || 'Unable to update the queue.');
++  return data;
++}
++
++function EditItem({ item, users, save, busy }: any) {
++  const [status, setStatus] = useState(item.status);
++  const [priority, setPriority] = useState(item.priority);
++  const [assignee, setAssignee] = useState(users.some((u: any) => u.uuid === item.assignee) ? item.assignee : '');
++  const [note, setNote] = useState('');
++  return <form onSubmit={e => { e.preventDefault(); save(item, { status, priority, assignee, note }); }}>
++    <div className="rq-fields">
++      <label>Status<select value={status} onChange={e => setStatus(e.target.value)}>{Object.entries(statuses).map(([v, title]) => <option key={v} value={v}>{title}</option>)}</select></label>
++      <label>Priority<select value={priority} onChange={e => setPriority(e.target.value)}>{priorities.map(v => <option key={v} value={v}>{v}</option>)}</select></label>
++      <label>Assigned to<select value={assignee} onChange={e => setAssignee(e.target.value)}><option value="">Unassigned</option>{users.map((u: any) => <option key={u.uuid} value={u.uuid}>{u.firstName} {u.lastName}</option>)}</select></label>
++    </div>
++    <label>Reviewer note / verification evidence<textarea value={note} maxLength={4000} rows={3} required={status === 'verified'} onChange={e => setNote(e.target.value)} placeholder="Record the proposed approach, review, or manual test result." /></label>
++    <p>Verified requires evidence. Changing status does not apply a fix or change the matrix score.</p>
++    <button className="ui primary button" disabled={busy} type="submit">Save work item</button>
++  </form>;
++}
++
++export default function RemediationWorkQueue({ projectID }: { projectID: string }) {
++  const [data, setData] = useState<any>({ items: [], users: [], sections: [], candidates: [] });
++  const [sectionID, setSectionID] = useState('');
++  const [chosen, setChosen] = useState<string[]>([]);
++  const [activePage, setActivePage] = useState<any>(null);
++  const [filter, setFilter] = useState('open');
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState('');
++  const [message, setMessage] = useState('');
++  const generation = useRef(0);
++  const base = `/project/${encodeURIComponent(projectID)}/accessibility/workqueue`;
++  async function load() {
++    const current = ++generation.current;
++    const next = await request(`${base}?sectionID=${encodeURIComponent(sectionID)}`);
++    if (current === generation.current) setData(next);
++  }
++  useEffect(() => {
++    setChosen([]); setError('');
++    load().catch(e => setError(e.message));
++    return () => { generation.current++; };
++  }, [projectID, sectionID]);
++  async function act(fn: () => Promise<any>, success: (r: any) => string) {
++    setBusy(true); setError(''); setMessage('');
++    try { const result = await fn(); await load(); setChosen([]); setMessage(success(result)); }
++    catch (e: any) { setError(e.message); }
++    finally { setBusy(false); }
++  }
++  const users = new Map(data.users.map((u: any) => [u.uuid, `${u.firstName} ${u.lastName}`]));
++  const existing = new Set(data.items.map((i: any) => i.key));
++  const items = data.items.filter((i: any) => filter === 'all' || (filter === 'open' ? i.status !== 'verified' : i.status === filter));
++  return <section className="ui segment remediation-work-queue" aria-label="Remediation work queue">
++    <style>{`.remediation-work-queue{margin:1.5rem 0!important}.remediation-work-queue h2{margin-top:0}.remediation-work-queue select,.remediation-work-queue textarea{display:block;padding:.55rem;border:1px solid #999;border-radius:4px;background:white;color:#222;max-width:100%;width:100%}.remediation-work-queue label{display:block;font-weight:600}.remediation-work-queue textarea{margin:.4rem 0}.rq-fields{display:flex;gap:1rem;flex-wrap:wrap;margin:1rem 0}.rq-fields label{flex:1;min-width:160px}.rq-candidates{max-height:260px;overflow:auto;margin:1rem 0;padding:.5rem;border:1px solid #ccc}.rq-candidates label{padding:.5rem;font-weight:normal}.rq-candidates input{margin-right:.6rem}.rq-table{overflow:auto}.rq-table table{min-width:640px}.rq-table td{vertical-align:top}.rq-table summary{cursor:pointer;font-weight:600;margin:.5rem 0}.rq-evidence{white-space:pre-wrap;overflow-wrap:anywhere;max-height:150px;overflow:auto}.rq-history{padding-left:1.3rem}.rq-history li{margin:.6rem 0}.remediation-work-queue :focus-visible{outline:3px solid #1565c0;outline-offset:2px}`}</style>
++    <h2>Remediation work queue</h2>
++    <p>Assign findings and manual checks, record progress, and keep reviewer notes across scans.</p>
++    <p><strong>{data.items.filter((i: any) => i.status !== 'verified').length} open</strong> · {data.items.filter((i: any) => i.status === 'verified').length} verified</p>
++    {error && <div role="alert" className="ui negative message">{error}</div>}
++    <div role="status" aria-live="polite">{message}</div>
++    {data.canEdit && <><label>Page tools<select value={activePage?.section.id || ''} onChange={e => { const section = data.sections.find((s: any) => s.id === e.target.value); setActivePage(section ? { section } : null); }}><option value="">Choose a page to fix or restore</option>{data.sections.map((s: any) => <option key={s.id} value={s.id}>{s.title}</option>)}</select></label></>}
++    {activePage && data.canEdit && <RemediationPageActions key={`${activePage.section.id}-${activePage.item?._id || ''}`} {...activePage} base={base} request={request} refreshed={load} close={() => setActivePage(null)} />}
++    {data.canEdit && <details><summary>Add work from a page review</summary>
++      <label>Page<select value={sectionID} disabled={busy} onChange={e => setSectionID(e.target.value)}><option value="">Choose a page</option>{data.sections.map((s: any) => <option key={s.id} value={s.id}>{s.title}</option>)}</select></label>
++      {sectionID && <><p>Choose findings or manual checks. Existing items are retained; adding again does not duplicate them.</p>
++        <div className="rq-candidates">{data.candidates.map((c: any) => <label key={c.key}><input type="checkbox" disabled={busy || existing.has(c.key)} checked={existing.has(c.key) || chosen.includes(c.key)} onChange={e => setChosen(prev => e.target.checked ? [...prev, c.key] : prev.filter(k => k !== c.key))} />{c.criterionID} · {c.title} {existing.has(c.key) && '(already queued)'}</label>)}{!data.candidates.length && <p>No stored failed or manual criteria. Scan this page first.</p>}</div>
++        <button type="button" className="ui primary button" disabled={busy || !chosen.length || chosen.length > 100} onClick={() => act(() => request(base, 'POST', { sectionID, keys: chosen }), r => `${r.created} work item(s) added.`)}>Add selected ({chosen.length})</button></>}
++    </details>}
++    <div className="rq-fields"><label>Show<select value={filter} onChange={e => setFilter(e.target.value)}><option value="open">All open items</option><option value="all">All items</option>{Object.entries(statuses).map(([v, title]) => <option key={v} value={v}>{title}</option>)}</select></label><div><button type="button" className="ui button" disabled={busy} onClick={() => act(() => Promise.resolve(), () => 'Queue refreshed.')}>Refresh queue</button></div></div>
++    {!items.length ? <p>No work items in this view.</p> : <div className="rq-table"><table className="ui celled table"><thead><tr><th>Page and finding</th><th>Assignment</th><th>Progress and review</th></tr></thead><tbody>{items.map((item: any) => <tr key={item._id}>
++      <td><strong>{item.sectionTitle}</strong>{data.canEdit && <p><button type="button" className="ui button" onClick={() => setActivePage({ section: { id: item.sectionID, title: item.sectionTitle }, item })}>Fix and rescan task</button></p>}<p>{item.criterionID} · {item.title}</p>{/^https:\/\//.test(item.sectionURL) && <a href={item.sectionURL} target="_blank" rel="noopener noreferrer">Open source page</a>}<details><summary>Original scan evidence</summary><p>{item.ruleId} {item.selector}</p><pre className="rq-evidence">{item.evidence}</pre><p>Captured: {item.scannedAt ? new Date(item.scannedAt).toLocaleString() : 'Not recorded'}. Evidence may change after a rescan; verification is explicit.</p></details></td>
++      <td>{String(users.get(item.assignee) || (item.assignee ? 'Former team member' : 'Unassigned'))}<p>Priority: {item.priority}</p></td>
++      <td><strong>{label(item.status)}</strong>{!!item.scanEvidence?.length && <details><summary>Scan evidence ({item.scanEvidence.length})</summary><ol className="rq-history">{item.scanEvidence.map((e: any, n: number) => <li key={n}><strong>{e.action}</strong> · {new Date(e.at).toLocaleString()}<p>Criterion result: {e.criterion?.status || 'Not available'}. Matching findings: {e.findings?.length ?? 'Not available'}.</p>{e.scanError && <p>{e.scanError}</p>}<details><summary>Evidence details</summary><pre className="rq-evidence">{JSON.stringify(e, null, 2)}</pre></details></li>)}</ol></details>}<details><summary>History ({item.history.length})</summary><ol className="rq-history">{item.history.map((h: any, n: number) => <li key={n}>{new Date(h.at).toLocaleString()} · {String(users.get(h.actor) || h.actor)} · {label(h.status)}<p>{h.note}</p></li>)}</ol></details>
++      {data.canEdit && <details key={`${item._id}-${item.version}`}><summary>Edit work item</summary><EditItem item={item} users={data.users} busy={busy} save={(i: any, fields: any) => act(() => request(`${base}/${i._id}`, 'PATCH', { ...fields, version: i.version }), () => 'Work item saved.')} /></details>}</td>
++    </tr>)}</tbody></table></div>}
++  </section>;
++}
+diff --git a/client/src/remediation-queue-entry.tsx b/client/src/remediation-queue-entry.tsx
+new file mode 100644
+index 00000000..c3b430d0
+--- /dev/null
++++ b/client/src/remediation-queue-entry.tsx
+@@ -0,0 +1,26 @@
++/** Isolated deployment entry for the existing demo image. Normal builds mount
++ * the same component directly from ProjectAccessibility. */
++import React from 'react';
++import { createRoot, Root } from 'react-dom/client';
++import RemediationWorkQueue from './components/projects/RemediationWorkQueue';
++
++let root: Root | undefined;
++let host: HTMLDivElement | undefined;
++let project = '';
++let pending = false;
++function sync() {
++  pending = false;
++  const id = location.pathname.match(/^\/projects\/([^/]+)\/accessibility\/?$/)?.[1] || '';
++  const anchor = document.querySelector('.wcag-summary-segment');
++  if (root && (!host?.isConnected || id !== project || !anchor)) {
++    root.unmount(); host?.remove(); root = undefined; host = undefined;
++  }
++  if (!id || !anchor || root || document.querySelector('.remediation-work-queue')) return;
++  host = document.createElement('div');
++  anchor.after(host); project = id;
++  root = createRoot(host); root.render(<RemediationWorkQueue projectID={decodeURIComponent(id)} />);
++}
++new MutationObserver(() => {
++  if (!pending) { pending = true; requestAnimationFrame(sync); }
++}).observe(document.body, { childList: true, subtree: true });
++sync();
+diff --git a/docs/remediation-integration.md b/docs/remediation-integration.md
+new file mode 100644
+index 00000000..6769a92a
+--- /dev/null
++++ b/docs/remediation-integration.md
+@@ -0,0 +1,48 @@
++# Accessibility remediation integration
++
++## Components and ownership
++
++Conductor authenticates the instructor and checks project edit permission before resolving the source page from the stored project section. It proxies page actions through the Remedy gateway, which forwards to the Remedy bridge. The bridge generates reviewed changes and performs guarded CXone writes. Credentials remain server-managed; instructor-owned inference keys are not supported.
++
++- Conductor: `server/api/remediationqueue.ts`, `server/api/remediationactions.ts`, `client/src/components/projects/RemediationWorkQueue.tsx`, and `RemediationPageActions.tsx`.
++- Remedy gateway: `backend/app/cxone_routes.py` in `libretexts-remedy-server-dev`.
++- Remedy bridge: `packages/conductor-panel/server/server.ts` and `packages/core/src/{review-alt,revert,agent-loop}.ts` in `libretexts-remedy-bridge-dev`.
++
++## Workflow and API
++
++The queue is mounted on the project accessibility page. A task opens its source page; a fresh scan selects the finding by rule and selector. The reviewer generates a preview, inspects the image and diff, optionally edits proposed alt text, acknowledges the reviewed preview, and applies it. Apply rescans the source and attaches evidence to the originating task. Restore lists saved versions, requires a separate preview and acknowledgement, then restores and rescans.
++
++Conductor routes use `/project/:projectID/accessibility/workqueue`. Page actions use `/page/:sectionID/:action` beneath that base: `scan`, `preview`, `revise-preview`, `apply`, `snapshots`, `restore-preview`, and `restore`. Browser-supplied source page IDs, URLs, snapshot paths, and scan evidence are not authoritative.
++
++Queue records persist in MongoDB with a unique project/finding key, optimistic version checks, assignment, priority, history, and scan evidence. Verification requires a reviewer note. Neither apply, scan, nor restore automatically verifies a task.
++
++## Configuration and safeguards
++
++Conductor uses `REMEDY_API_BASE_URL` and the existing gateway authentication configuration. Deploy the gateway recovery routes and bridge endpoints together with the Conductor changes. Preserve each deployment's environment files, compose overrides, networks, and persistent snapshot volume.
++
++Bridge inference settings are documented in its `.env.example`. The shared client supports Ollama primary and OpenAI fallback for text, vision, and advanced agent tool calls. OpenAI tool calls use Responses, with tool-result and reasoning-context replay. Availability failures can trigger fallback; invalid requests and refusals do not.
++
++Static GIF and other supported static image formats are decoded to PNG for inference. Animated/multipage images require manual review. Conversion does not replace the original source image. Reviewed alt edits are restricted to images in the selected preview, escape attribute content, and preserve surrounding HTML.
++
++Apply and restore validate the live content hash. Restore binds its expiring token to the page and snapshot, validates snapshot metadata and content integrity, and creates a safety snapshot before writing. CXone writes retain the existing sandbox guard. A successful content write followed by a scan/evidence failure is reported separately so the reviewer can retry the scan without repeating the write.
++
++## Validation
++
++- Remedy core: `npm run test --workspace @libretexts/remedy-core -- --run` — 155 tests passed.
++- Conductor, from `server`: `./node_modules/.bin/tsx --test util/remediationactions.test.ts util/remediationqueue.test.ts util/corsPolicy.test.ts util/a11yreviewutils.test.ts` — 15 tests passed.
++- Gateway: `python3 -m pytest tests/unit/test_cxone_recovery_routes.py -q` — 2 tests passed.
++- Focused TypeScript checks cover the new client/server modules and bridge core.
++
++Browser acceptance on 2026-09-13 covered task creation, source-image inference, edited preview, single-attribute apply, rescan, restore, evidence persistence, assignment, filtering, duplicate prevention, and required verification evidence. On a sandbox page, total findings changed 14 → 13 → 14 and the target criterion changed fail → pass → fail. The restore preview matched the original full-page HTML, and the final rescan confirmed the original finding returned. The content change was intentionally restored.
++
++## Known limitations
++
++- The deployed legacy matrix requires its reload control to display newly saved scan results; the task panel and evidence update immediately.
++- Page tools currently uses scan-success wording that claims task evidence was attached even when no task was selected.
++- A short alt summary does not expose every value in an image of a data table. Such images still need an accessible table or longer description and human review, even if the automatic alt check passes.
++- Model output requires subject-matter review. Automated checks are not accessibility certification.
++- The full legacy application build and every page-wide agent strategy are outside this scoped acceptance run.
++
++## Deployment notes
++
++The isolated `client/src/remediation-queue-entry.tsx` supports layering the same UI onto an existing compiled application. Normal source builds mount the component through `ProjectAccessibility.jsx`. The integration source is the durable handoff; environment-specific image tags and deployment credentials are managed separately.
+diff --git a/server/api.js b/server/api.js
+index 249ac7c0..eecbdf5c 100644
+--- a/server/api.js
++++ b/server/api.js
+@@ -29,6 +29,9 @@ import searchIndexManagementAPI from "./api/search-index-management.js";
+ import announcementAPI from "./api/announcements.js";
+ import peerReviewAPI from "./api/peerreview.js";
+ import projectsAPI from "./api/projects.js";
++import { registerRemediationQueue } from "./api/remediationqueue.js";
++import QueueProject from "./models/project.js";
++import QueueUser from "./models/user.js";
+ import projectfilesAPI from "./api/projectfiles.js";
+ import tasksAPI from "./api/tasks.js";
+ import msgAPI from "./api/messaging.js";
+@@ -2305,6 +2308,8 @@ router
+     projectsAPI.updateA11YReviewSectionItems
+   );
+ 
++registerRemediationQueue(router, { auth: authAPI, projects: projectsAPI, Project: QueueProject, User: QueueUser });
++
+ router
+   .route("/project/accessibility/remedy/scan")
+   .post(
+diff --git a/server/api/remediationactions.ts b/server/api/remediationactions.ts
+new file mode 100644
+index 00000000..b12af261
+--- /dev/null
++++ b/server/api/remediationactions.ts
+@@ -0,0 +1,67 @@
++/** Page actions are always resolved from the authorized project's stored section. */
++export function registerRemediationActions(router: any, { base, access, Project, WorkItems, bridge = callBridge }: any) {
++  router.post(`${base}/page/:sectionID/:action`, ...access, async (req: any, res: any) => {
++    try {
++      const section = (req.queueProject.a11yReview || []).find((s: any) => String(s._id) === req.params.sectionID);
++      if (!section) return res.status(404).json({ err: true, errMsg: 'Page is not in this project.' });
++      const endpoints: Record<string, string> = { scan: 'scan', preview: 'preview-fix', 'revise-preview': 'revise-preview', apply: 'apply-fix', snapshots: 'snapshots', 'restore-preview': 'restore-preview', restore: 'restore' };
++      const action = req.params.action;
++      if (!endpoints[action]) return res.status(400).json({ err: true, errMsg: 'Unknown page action.' });
++      const url = new URL(section.sectionURL);
++      const path = decodeURIComponent(url.pathname);
++      if (url.protocol !== 'https:' || url.hostname !== 'dev.libretexts.org' || !(path === '/Sandboxes/johnnyphung' || path.startsWith('/Sandboxes/johnnyphung/'))) {
++        return res.status(403).json({ err: true, errMsg: 'Remediation is limited to the Johnny sandbox.' });
++      }
++      const item = req.body.itemID ? await WorkItems.findOne({ _id: req.body.itemID, projectID: req.params.projectID, sectionID: req.params.sectionID }).lean() : null;
++      if (req.body.itemID && !item) return res.status(404).json({ err: true, errMsg: 'Work item is not on this project page.' });
++      const page = { page_url: section.sectionURL, section_title: section.sectionTitle };
++      // Browser-provided URLs, IDs, snapshots paths and scan evidence are never forwarded.
++      const body = { ...page, finding_ids: req.body.findingIDs, fix_mode: req.body.fixMode,
++        tier: req.body.tier, preview_hash: req.body.previewHash, preview_token: req.body.previewToken,
++        alt_edits: req.body.altEdits, snapshot_timestamp: req.body.snapshotTimestamp };
++      const scan = () => bridge('scan', { ...page, wcag_review: section.wcagReview, doj_exceptions: section.dojExceptions || [] });
++      const persistScan = async (result: any) => {
++        await Project.updateOne({ projectID: req.params.projectID, 'a11yReview._id': section._id }, {
++          $set: { 'a11yReview.$.wcagReview': result.wcag_review || result.wcagReview,
++            'a11yReview.$.dojExceptions': result.doj_exceptions || result.dojExceptions || [] },
++        });
++      };
++      const result = action === 'scan' ? await scan() : await bridge(endpoints[action], body);
++      let scanResult = action === 'scan' ? result : null;
++      let scanError: string | undefined;
++      if (action === 'apply' || action === 'restore') {
++        try { scanResult = await scan(); } catch { scanError = 'The page action completed, but rescan failed. Use Rescan page to retry.'; }
++      }
++      if (scanResult) {
++        try { await persistScan(scanResult); } catch { scanError = 'Scan completed but the matrix could not be saved. Rescan to retry.'; }
++      }
++      let evidenceError: string | undefined;
++      if (item && ['scan', 'apply', 'restore'].includes(action)) {
++        const criterion = (scanResult?.wcag_review || scanResult?.wcagReview)?.criteria?.find((c: any) => c.id === item.criterionID);
++        const findings = scanResult?.findings?.filter((f: any) => f.ruleId === item.ruleId && (!item.selector || f.selector === item.selector));
++        const evidence = { action, at: new Date(), actor: req.user.decoded.uuid,
++          scannedAt: scanResult?.scanned_at, criterion, findings,
++          result: action === 'scan' ? undefined : result, scanError };
++        try {
++          await WorkItems.updateOne({ _id: item._id, projectID: req.params.projectID }, { $push: { scanEvidence: evidence }, $inc: { version: 1 } });
++        } catch { evidenceError = 'Page action completed but task evidence could not be saved. Rescan from this task to retry.'; }
++      }
++      res.json({ err: false, ...result, page_url: section.sectionURL, scan: scanResult ? { ...scanResult, page_url: section.sectionURL } : null, scanError, evidenceError });
++    } catch (e: any) { res.status(e.status || 500).json({ err: true, errMsg: e.publicMessage || 'Page action failed. Refresh and try again.' }); }
++  });
++}
++
++async function callBridge(action: string, body: unknown) {
++  const base = (process.env.REMEDY_API_BASE_URL || process.env.PROJECT_REMEDY_BASE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
++  const key = process.env.REMEDY_API_KEY || process.env.PROJECT_REMEDY_API_KEY;
++  const response = await fetch(`${base}/v1/cxone/page/${action}`, { method: 'POST',
++    headers: { 'Content-Type': 'application/json', ...(key ? { 'X-API-Key': key } : {}) },
++    body: JSON.stringify(body), signal: AbortSignal.timeout(600_000) });
++  const data: any = await response.json();
++  if (!response.ok) {
++    const err: any = new Error('Bridge rejected action'); err.status = response.status;
++    err.publicMessage = data.detail?.message || (typeof data.detail === 'string' ? data.detail : 'Remedy could not complete this action.');
++    throw err;
++  }
++  return data;
++}
+diff --git a/server/api/remediationqueue.ts b/server/api/remediationqueue.ts
+new file mode 100644
+index 00000000..0e60e0f2
+--- /dev/null
++++ b/server/api/remediationqueue.ts
+@@ -0,0 +1,81 @@
++import mongoose from 'mongoose';
++import { registerRemediationActions } from './remediationactions.js';
++import { queueCandidates, projectAssignees, validateQueueUpdate, queueStatuses, queuePriorities } from '../util/remediationqueue.js';
++
++const schema = new mongoose.Schema({
++  projectID: { type: String, required: true }, key: { type: String, required: true },
++  sectionID: String, pageID: String, sectionTitle: String, sectionURL: String,
++  criterionID: String, criterionTitle: String, kind: String, ruleId: String,
++  selector: String, title: String, evidence: String, scannedAt: String, fixable: Boolean,
++  status: { type: String, enum: queueStatuses, default: 'todo' },
++  priority: { type: String, enum: queuePriorities, default: 'normal' },
++  assignee: { type: String, default: '' }, version: { type: Number, default: 0 },
++  scanEvidence: [mongoose.Schema.Types.Mixed],
++  createdBy: String, verifiedBy: String, verifiedAt: Date,
++  history: [{ actor: String, at: Date, status: String, priority: String, assignee: String, note: String }],
++}, { timestamps: true });
++schema.index({ projectID: 1, key: 1 }, { unique: true });
++const WorkItem = mongoose.models.RemediationWorkItem || mongoose.model('RemediationWorkItem', schema);
++
++/** Dependencies are injected so this module also layers onto the existing deployed bundle. */
++export function registerRemediationQueue(router: any, { auth, projects, Project, User, WorkItems = WorkItem, bridge }: any) {
++  const base = '/project/:projectID/accessibility/workqueue';
++  const authorize = async (req: any, res: any, next: any) => {
++    try {
++      if (!/^[\w-]{1,100}$/.test(req.params.projectID)) return res.status(400).json({ err: true, errMsg: 'Invalid project.' });
++      const project = await Project.findOne({ projectID: req.params.projectID }).lean();
++      if (!project || !projects.checkProjectMemberPermission(project, req.user)) return res.status(403).json({ err: true, errMsg: 'Project team access required.' });
++      req.queueCanEdit = projectAssignees(project).includes(req.user.decoded.uuid) || auth.checkHasRole(req.user, 'libretexts', ['superadmin', 'support']);
++      if (req.method !== 'GET' && !req.queueCanEdit) return res.status(403).json({ err: true, errMsg: 'Project editing permission required.' });
++      req.queueProject = project;
++      next();
++    } catch { res.status(500).json({ err: true, errMsg: 'Unable to load the work queue.' }); }
++  };
++  const access = [auth.verifyRequest, auth.getUserAttributes, authorize];
++  registerRemediationActions(router, { base, access, Project, WorkItems, bridge });
++  router.get(base, ...access, async (req: any, res: any) => {
++    try {
++      const sections = req.queueProject.a11yReview || [];
++      const selected = sections.find((s: any) => String(s._id) === req.query.sectionID);
++      const users = await User.find({ uuid: { $in: projectAssignees(req.queueProject) } }).select('uuid firstName lastName -_id').lean();
++      const items = await WorkItems.find({ projectID: req.params.projectID }).sort({ createdAt: -1 }).lean();
++      res.json({ err: false, canEdit: req.queueCanEdit, items, users, sections: sections.map((s: any) => ({ id: String(s._id), title: s.sectionTitle })), candidates: selected ? queueCandidates(selected) : [] });
++    } catch { res.status(500).json({ err: true, errMsg: 'Unable to load the work queue.' }); }
++  });
++  router.post(base, ...access, async (req: any, res: any) => {
++    try {
++      const { sectionID, keys } = req.body || {};
++      const section = (req.queueProject.a11yReview || []).find((s: any) => String(s._id) === sectionID);
++      if (!section || !Array.isArray(keys) || !keys.length || keys.length > 100 || keys.some(k => typeof k !== 'string')) return res.status(400).json({ err: true, errMsg: 'Choose 1–100 findings from a current page review.' });
++      const candidates = queueCandidates(section), chosen = candidates.filter(x => keys.includes(x.key));
++      if (chosen.length !== new Set(keys).size) return res.status(409).json({ err: true, errMsg: 'Review changed. Refresh the available findings.' });
++      const actor = req.user.decoded.uuid;
++      const result = await WorkItems.bulkWrite(chosen.map(item => ({ updateOne: {
++        filter: { projectID: req.params.projectID, key: item.key },
++        update: { $setOnInsert: { ...item, projectID: req.params.projectID, status: 'todo', priority: 'normal', assignee: '', version: 0, createdBy: actor,
++          history: [{ actor, at: new Date(), status: 'todo', priority: 'normal', assignee: '', note: 'Added from accessibility review.' }] } }, upsert: true,
++      } })), { ordered: false });
++      res.json({ err: false, created: result.upsertedCount });
++    } catch (e: any) {
++      if (e.code === 11000) return res.json({ err: false, created: 0 });
++      res.status(500).json({ err: true, errMsg: 'Unable to add work items.' });
++    }
++  });
++  router.patch(`${base}/:itemID`, ...access, async (req: any, res: any) => {
++    let changes;
++    try {
++      if (!mongoose.isValidObjectId(req.params.itemID)) throw Error('Invalid work item.');
++      changes = validateQueueUpdate(req.body, projectAssignees(req.queueProject));
++    } catch (e: any) { return res.status(400).json({ err: true, errMsg: e.message }); }
++    try {
++      const actor = req.user.decoded.uuid, at = new Date();
++      const { note, ...fields } = changes;
++      const item = await WorkItems.findOneAndUpdate({ _id: req.params.itemID, projectID: req.params.projectID, version: req.body.version }, {
++        $set: { ...fields, verifiedBy: fields.status === 'verified' ? actor : '', verifiedAt: fields.status === 'verified' ? at : null },
++        $inc: { version: 1 }, $push: { history: { actor, at, ...changes } },
++      }, { new: true, runValidators: true }).lean();
++      if (!item) return res.status(409).json({ err: true, errMsg: 'Item changed or is unavailable. Refresh before saving.' });
++      res.json({ err: false, item });
++    } catch { res.status(500).json({ err: true, errMsg: 'Unable to update this work item.' }); }
++  });
++}
+diff --git a/server/util/remediationactions.test.ts b/server/util/remediationactions.test.ts
+new file mode 100644
+index 00000000..7c943c73
+--- /dev/null
++++ b/server/util/remediationactions.test.ts
+@@ -0,0 +1,46 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import express from 'express';
++import { registerRemediationQueue } from '../api/remediationqueue.js';
++
++async function harness(run: (url: string, calls: any[], evidence: any[], row: any) => Promise<void>, failScan = false) {
++  const calls: any[] = [], evidence: any[] = [];
++  const section = { _id: 'section1', sectionURL: 'https://dev.libretexts.org/Sandboxes/johnnyphung/Test', sectionTitle: 'Test' };
++  const row = { _id: '012345678901234567890123', projectID: 'demo', sectionID: 'section1', ruleId: 'img-alt', selector: 'img', criterionID: '1.1.1', status: 'in_progress' };
++  const project = { projectID: 'demo', members: ['alice'], auditors: ['auditor'], a11yReview: [section] };
++  const app = express(); app.use(express.json());
++  registerRemediationQueue(app, {
++    auth: { verifyRequest: (req: any, res: any, next: any) => { if (!req.headers['x-user']) return res.sendStatus(401); req.user = { decoded: { uuid: req.headers['x-user'] } }; next(); }, getUserAttributes: (_r: any, _s: any, n: any) => n(), checkHasRole: () => false },
++    projects: { checkProjectMemberPermission: (p: any, u: any) => [...p.members, ...p.auditors].includes(u.decoded.uuid) },
++    Project: { findOne: () => ({ lean: async () => project }), updateOne: async () => {} }, User: {},
++    WorkItems: { findOne: (filter: any) => ({ lean: async () => filter._id === row._id && filter.sectionID === row.sectionID && filter.projectID === row.projectID ? row : null }), updateOne: async (_f: any, update: any) => { evidence.push(update.$push.scanEvidence); } },
++    bridge: async (action: string, body: any) => { calls.push({ action, body }); if (action === 'scan') { if (failScan) throw Error('down'); return { scanned_at: 'now', findings: [], wcag_review: { criteria: [{ id: '1.1.1', status: 'pass' }] } }; } return { applied: true, snapshot_path: '/data/snapshot.json' }; },
++  });
++  const server = app.listen(0, '127.0.0.1'); await new Promise<void>(r => server.once('listening', r));
++  try { await run(`http://127.0.0.1:${(server.address() as any).port}/project/demo/accessibility/workqueue/page/section1`, calls, evidence, row); }
++  finally { await new Promise<void>(r => server.close(() => r())); }
++}
++const send = (url: string, body = {}, user = 'alice') => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(user ? { 'x-user': user } : {}) }, body: JSON.stringify(body) });
++test('page actions enforce authentication, edit permission, section and item scope', async () => harness(async (url, calls) => {
++  assert.equal((await send(`${url}/restore`, {}, '')).status, 401);
++  assert.equal((await send(`${url}/restore`, {}, 'auditor')).status, 403);
++  assert.equal((await send(`${url}/scan`, {}, 'outsider')).status, 403);
++  assert.equal((await send(`${url.replace('section1', 'missing')}/scan`)).status, 404);
++  assert.equal((await send(`${url}/apply`, { itemID: 'another-item' })).status, 404);
++  assert.equal(calls.length, 0);
++}));
++test('apply rescans, saves server evidence, ignores forged page data, and leaves verification to reviewer', async () => harness(async (url, calls, evidence, row) => {
++  const response = await send(`${url}/apply`, { itemID: row._id, sectionURL: 'https://evil.test', page_id: 999, scan: { status: 'pass' } });
++  assert.equal(response.status, 200);
++  assert.deepEqual(calls.map(c => c.action), ['apply-fix', 'scan']);
++  assert.equal(calls[0].body.page_url, 'https://dev.libretexts.org/Sandboxes/johnnyphung/Test');
++  assert.equal(calls[0].body.page_id, undefined);
++  assert.equal(evidence[0].criterion.status, 'pass'); assert.equal(evidence[0].actor, 'alice');
++  assert.equal(row.status, 'in_progress');
++}));
++test('successful restore remains visible and recorded when its rescan fails', async () => harness(async (url, calls, evidence, row) => {
++  const data = await (await send(`${url}/restore`, { itemID: row._id, previewToken: 'reviewed-token', previewHash: 'hash', snapshotPath: '/etc/passwd' })).json();
++  assert.match(data.scanError, /completed, but rescan failed/);
++  assert.equal(calls[0].body.preview_token, 'reviewed-token'); assert.equal(calls[0].body.snapshot_path, undefined);
++  assert.equal(evidence[0].action, 'restore'); assert.ok(evidence[0].result.snapshot_path);
++}, true));
+diff --git a/server/util/remediationqueue.test.ts b/server/util/remediationqueue.test.ts
+new file mode 100644
+index 00000000..dc09b967
+--- /dev/null
++++ b/server/util/remediationqueue.test.ts
+@@ -0,0 +1,91 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import express from 'express';
++import { registerRemediationQueue } from '../api/remediationqueue.js';
++import { queueCandidates, validateQueueUpdate } from './remediationqueue.js';
++
++const section = { _id: 'section1', pageID: '4218', sectionTitle: 'Test page', sectionURL: 'https://dev.libretexts.org/Sandboxes/johnnyphung/test', wcagReview: { scannedAt: '2026-09-13', criteria: [
++  { id: '1.1.1', title: 'Non-text content', status: 'fail', evidence: [{ findingId: 'img-alt#0', ruleId: 'img-alt', selector: 'img:first-child', message: 'Missing alt', snippet: '<img>' }] },
++  { id: '2.1.1', title: 'Keyboard', status: 'manual_review' },
++] } };
++
++test('candidate identity survives finding index and timestamp changes', () => {
++  const next = structuredClone(section);
++  next.wcagReview.scannedAt = '2026-10-01';
++  next.wcagReview.criteria[0].evidence![0].findingId = 'img-alt#27';
++  assert.equal(queueCandidates(section)[0].key, queueCandidates(next)[0].key);
++  assert.equal(queueCandidates(section)[1].kind, 'manual');
++});
++
++test('verification needs evidence and assignment must be to a project member', () => {
++  const base = { version: 0, status: 'verified', priority: 'normal', assignee: 'alice', note: '' };
++  assert.throws(() => validateQueueUpdate(base, ['alice']), /verification evidence/);
++  assert.throws(() => validateQueueUpdate({ ...base, note: 'tested', assignee: 'outsider' }, ['alice']), /team member/);
++  assert.equal(validateQueueUpdate({ ...base, note: 'Keyboard test passed' }, ['alice']).status, 'verified');
++});
++
++async function harness(run: (url: string, rows: any[]) => Promise<void>) {
++  const rows: any[] = [];
++  const project = { projectID: 'demo', members: ['alice', 'bob'], auditors: ['auditor'], a11yReview: [section] };
++  const WorkItems = {
++    find: ({ projectID }: any) => ({ sort: () => ({ lean: async () => rows.filter(r => r.projectID === projectID) }) }),
++    bulkWrite: async (ops: any[]) => {
++      let upsertedCount = 0;
++      for (const { updateOne: o } of ops) if (!rows.some(r => r.projectID === o.filter.projectID && r.key === o.filter.key)) {
++        rows.push({ ...o.update.$setOnInsert, _id: '012345678901234567890123' }); upsertedCount++;
++      }
++      return { upsertedCount };
++    },
++    findOneAndUpdate: (filter: any, update: any) => ({ lean: async () => {
++      const row = rows.find(r => r._id === filter._id && r.projectID === filter.projectID && r.version === filter.version);
++      if (!row) return null;
++      Object.assign(row, update.$set); row.version++; row.history.push(update.$push.history); return row;
++    } }),
++  };
++  const app = express(); app.use(express.json());
++  registerRemediationQueue(app, {
++    auth: { verifyRequest: (req: any, res: any, next: any) => { if (!req.headers['x-user']) return res.sendStatus(401); req.user = { decoded: { uuid: req.headers['x-user'] } }; next(); }, getUserAttributes: (_r: any, _s: any, n: any) => n(), checkHasRole: () => false },
++    projects: { checkProjectMemberPermission: (p: any, u: any) => [...p.members, ...p.auditors].includes(u.decoded.uuid) },
++    Project: { findOne: (q: any) => ({ lean: async () => q.projectID === 'demo' ? project : null }) },
++    User: { find: () => ({ select: () => ({ lean: async () => [{ uuid: 'alice', firstName: 'Alice' }, { uuid: 'bob', firstName: 'Bob' }] }) }) }, WorkItems,
++  });
++  const server = app.listen(0, '127.0.0.1');
++  await new Promise<void>(r => server.once('listening', r));
++  try { await run(`http://127.0.0.1:${(server.address() as any).port}/project/demo/accessibility/workqueue`, rows); }
++  finally { await new Promise<void>(r => server.close(() => r())); }
++}
++const send = (url: string, method = 'GET', body?: any, user = 'alice') => fetch(url, { method, headers: { 'Content-Type': 'application/json', ...(user ? { 'x-user': user } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) });
++
++test('API blocks unauthenticated users, outsiders, and auditor writes', async () => harness(async url => {
++  assert.equal((await send(url, 'GET', undefined, '')).status, 401);
++  assert.equal((await send(url, 'GET', undefined, 'outsider')).status, 403);
++  assert.equal((await send(url, 'POST', {}, 'auditor')).status, 403);
++  assert.equal((await send(url, 'GET', undefined, 'auditor')).status, 200);
++}));
++
++test('imports authoritative evidence, deduplicates imports and preserves notes', async () => harness(async (url, rows) => {
++  const body = { sectionID: 'section1', keys: [queueCandidates(section)[0].key], title: 'Forged title', status: 'verified' };
++  assert.equal((await (await send(url, 'POST', body)).json()).created, 1);
++  const patch = { version: 0, assignee: 'bob', status: 'in_progress', priority: 'high', note: 'Review description with author' };
++  assert.equal((await send(`${url}/${rows[0]._id}`, 'PATCH', patch)).status, 200);
++  assert.equal((await (await send(url, 'POST', body)).json()).created, 0);
++  assert.equal(rows.length, 1); assert.equal(rows[0].title, 'Missing alt');
++  assert.equal(rows[0].status, 'in_progress'); assert.equal(rows[0].history[1].note, patch.note);
++}));
++
++test('stale updates and cross-project IDs cannot overwrite an item', async () => harness(async (url, rows) => {
++  await send(url, 'POST', { sectionID: 'section1', keys: [queueCandidates(section)[0].key] });
++  const patch = { version: 0, assignee: '', status: 'needs_review', priority: 'normal', note: 'Ready' };
++  assert.equal((await send(`${url}/${rows[0]._id}`, 'PATCH', patch)).status, 200);
++  assert.equal((await send(`${url}/${rows[0]._id}`, 'PATCH', patch)).status, 409);
++  assert.equal((await send(`${url.replace('/demo/', '/other/')}/${rows[0]._id}`, 'PATCH', { ...patch, version: 1 })).status, 403);
++  assert.equal(rows[0].version, 1);
++}));
++
++test('verified updates require evidence and record the authenticated reviewer', async () => harness(async (url, rows) => {
++  await send(url, 'POST', { sectionID: 'section1', keys: [queueCandidates(section)[1].key] });
++  const patch = { version: 0, assignee: 'alice', status: 'verified', priority: 'normal', note: '' };
++  assert.equal((await send(`${url}/${rows[0]._id}`, 'PATCH', patch)).status, 400);
++  assert.equal((await send(`${url}/${rows[0]._id}`, 'PATCH', { ...patch, note: 'Keyboard-only traversal passed', verifiedBy: 'forged' })).status, 200);
++  assert.equal(rows[0].verifiedBy, 'alice');
++}));
+diff --git a/server/util/remediationqueue.ts b/server/util/remediationqueue.ts
+new file mode 100644
+index 00000000..66454a2e
+--- /dev/null
++++ b/server/util/remediationqueue.ts
+@@ -0,0 +1,42 @@
++import { createHash } from 'node:crypto';
++
++export const queueStatuses = ['todo', 'in_progress', 'needs_review', 'verified', 'blocked'] as const;
++export const queuePriorities = ['low', 'normal', 'high', 'urgent'] as const;
++export function projectAssignees(project: any): string[] {
++  return [...new Set(['leads', 'liaisons', 'members'].flatMap(k => project[k] || [])
++    .map((x: any) => typeof x === 'string' ? x : x.uuid).filter(Boolean))] as string[];
++}
++
++/** Evidence keys deliberately exclude scan-local finding indexes and scan timestamps. */
++export function queueCandidates(section: any) {
++  const result: any[] = [];
++  for (const criterion of section.wcagReview?.criteria || []) {
++    if (!['fail', 'manual_review', 'not_tested'].includes(criterion.status)) continue;
++    const evidence = criterion.status === 'fail' && criterion.evidence?.length ? criterion.evidence : [null];
++    for (const e of evidence) {
++      const key = createHash('sha256').update(JSON.stringify([
++        section.pageID || section.sectionURL, criterion.id, e?.ruleId || criterion.status,
++        e?.selector || e?.message || '',
++      ])).digest('hex');
++      if (result.some(x => x.key === key)) continue;
++      result.push({ key, sectionID: String(section._id), pageID: section.pageID || '',
++        sectionTitle: section.sectionTitle, sectionURL: section.sectionURL,
++        criterionID: criterion.id, criterionTitle: criterion.title,
++        kind: e ? 'finding' : 'manual', ruleId: e?.ruleId || '', selector: e?.selector || '',
++        title: e?.message || `${criterion.id}: ${criterion.title} — manual verification`,
++        evidence: e?.snippet || criterion.applicabilityReason || '',
++        scannedAt: section.wcagReview?.scannedAt || null, fixable: Boolean(e?.fixable) });
++    }
++  }
++  return result;
++}
++
++export function validateQueueUpdate(body: any, assignees: string[]) {
++  if (!body || !Number.isInteger(body.version) || body.version < 0) throw Error('A valid item version is required.');
++  if (!queueStatuses.includes(body.status)) throw Error('Choose a valid status.');
++  if (!queuePriorities.includes(body.priority)) throw Error('Choose a valid priority.');
++  if (typeof body.assignee !== 'string' || (body.assignee && !assignees.includes(body.assignee))) throw Error('Assignee must be a current project team member.');
++  if (typeof body.note !== 'string' || body.note.length > 4000) throw Error('Notes must be at most 4,000 characters.');
++  if (body.status === 'verified' && !body.note.trim()) throw Error('Add verification evidence before marking this item verified.');
++  return { status: body.status, priority: body.priority, assignee: body.assignee, note: body.note.trim() };
++}

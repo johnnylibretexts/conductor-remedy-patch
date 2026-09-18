@@ -1,0 +1,34 @@
+From aad8a192a45a00bb1eb3e47dda535707235f8143 Mon Sep 17 00:00:00 2001
+From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 10:55:28 -0700
+Subject: [PATCH 05/12] docs: document remediation release integration and
+ validation limits
+
+(cherry picked from commit 4bfeade5b72c0040294039e3393240167d2a0fa3)
+---
+ docs/remediation-integration.md | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/docs/remediation-integration.md b/docs/remediation-integration.md
+index 6769a92a..72af803b 100644
+--- a/docs/remediation-integration.md
++++ b/docs/remediation-integration.md
+@@ -18,7 +18,7 @@ Queue records persist in MongoDB with a unique project/finding key, optimistic v
+ 
+ ## Configuration and safeguards
+ 
+-Conductor uses `REMEDY_API_BASE_URL` and the existing gateway authentication configuration. Deploy the gateway recovery routes and bridge endpoints together with the Conductor changes. Preserve each deployment's environment files, compose overrides, networks, and persistent snapshot volume.
++Conductor uses `REMEDY_API_BASE_URL` and `REMEDY_API_KEY` (legacy aliases: `PROJECT_REMEDY_BASE_URL` and `PROJECT_REMEDY_API_KEY`). Deploy the gateway recovery routes and bridge endpoints together with the Conductor changes. Preserve each deployment's environment files, compose overrides, networks, and persistent snapshot volume.
+ 
+ Bridge inference settings are documented in its `.env.example`. The shared client supports Ollama primary and OpenAI fallback for text, vision, and advanced agent tool calls. OpenAI tool calls use Responses, with tool-result and reasoning-context replay. Availability failures can trigger fallback; invalid requests and refusals do not.
+ 
+@@ -46,3 +46,9 @@ Browser acceptance on 2026-09-13 covered task creation, source-image inference,
+ ## Deployment notes
+ 
+ The isolated `client/src/remediation-queue-entry.tsx` supports layering the same UI onto an existing compiled application. Normal source builds mount the component through `ProjectAccessibility.jsx`. The integration source is the durable handoff; environment-specific image tags and deployment credentials are managed separately.
++
++## Release references
++
++Matching component commits are Remedy Bridge `5d015f6981bc8ce125633c98af78e90ffffb9286` and Remedy Gateway `5893489cd84cdd38f1af59e7fed87c3a51d729d2`, published on `main` in their respective `johnnylibretexts` repositories. Use a fresh clone of the gateway repository when integrating this release; older checkouts have a different commit lineage.
++
++At publication on 2026-09-13, GitHub reported 33 dependency alerts for Remedy Bridge (3 critical, 11 high, 17 moderate, 2 low). These alerts were not triaged in the remediation acceptance run. Review the repository's dependency-security report before production promotion.

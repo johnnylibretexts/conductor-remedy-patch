@@ -1,0 +1,36 @@
+From 2e6dac30a3841fa2ccfe1e4e4f52742514205c27 Mon Sep 17 00:00:00 2001
+From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 20:35:46 -0700
+Subject: [PATCH 07/12] Document book remediation acceptance and static scanner
+ limitations
+
+(cherry picked from commit 9690cd8ef88831392c90dfe71c94a307a751bcca)
+---
+ docs/remediation-integration.md | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/docs/remediation-integration.md b/docs/remediation-integration.md
+index 3d26bb78..fee192ac 100644
+--- a/docs/remediation-integration.md
++++ b/docs/remediation-integration.md
+@@ -46,7 +46,7 @@ The isolated `client/src/remediation-queue-entry.tsx` supports layering the same
+ 
+ ## Release references
+ 
+-Matching component commits are Remedy Bridge `5d015f6981bc8ce125633c98af78e90ffffb9286` and Remedy Gateway `5893489cd84cdd38f1af59e7fed87c3a51d729d2`, published on `main` in their respective `johnnylibretexts` repositories. Use a fresh clone of the gateway repository when integrating this release; older checkouts have a different commit lineage.
++Matching component commits are Conductor `6f507dae2539c1f6182c88b7c81b0a91bad4a5f7`, Remedy Bridge `9170279`, and Remedy Gateway `5893489cd84cdd38f1af59e7fed87c3a51d729d2`, published on `main` in their respective repositories.
+ 
+ The follow-up Bridge dependency refresh addresses the 33 reported alerts. Full npm audit reports zero vulnerabilities; see the bridge repository's `docs/dependency-security.md` for resolved versions and validation.
+ 
+@@ -67,3 +67,11 @@ Live advanced-agent tests exercised both Ollama primary and OpenAI fallback. Eac
+ Axe incomplete checks retain informational severity and map to manual review, even when the rule's potential impact is critical. They are not reported as confirmed accessibility failures.
+ 
+ Transparent source images are composited onto white for inference so black chemical labels remain visible. The source image is never changed. Table-header inference requires an explicitly marked header row; ordinary first-row data is left for reviewer-supplied headers. Table associations support grouped columns and row spans and allocate IDs across the whole page.
++
++## Book-level acceptance
++
++An 82-page sandbox book was remediated with retained pre-write snapshots: duplicate IDs on 57 pages, 259 link-text edits, reviewed table structure on 12 pages, heading corrections on 15 pages, and 127 reviewed image descriptions. Complex-image descriptions include scientific relationships, data values and units, and chemical or sequence notation where needed. Generated proposals were checked against the actual images and corrected before applying. These content corrections were retained.
++
++A separate controlled alt-text change on an already-remediated page was restored through Conductor. The original long description remained intact; restore rescanned to zero findings and refreshed the matrix. Queue verification remains a reviewer action.
++
++The static scanner has a reproducible jsdom limitation on MathML: even `<math><mi>x</mi></math>` can make axe ARIA checks report a `getComputedStyle` error because the simulated MathML element lacks inline-style support. Related checks remain informational/manual review. Do not suppress these checks or interpret them as a pass; validate mathematical content and rendered-page behavior in a real browser. Keyboard behavior, contrast, and subject-matter adequacy still require reviewer checks.

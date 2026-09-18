@@ -1,11 +1,12 @@
 # conductor-remedy-patch
 
 The **Conductor side** of the LibreTexts Remedy accessibility matrix, shipped as
-three `git am`-able patches against upstream Conductor.
+twelve `git am`-able patches against upstream Conductor.
 
 This repository contains no Conductor source of its own. It is a delivery
-vehicle: you clone the real Conductor, apply these three commits, and you have
-the Project Accessibility WCAG matrix wired to a Remedy server.
+vehicle: you clone the real Conductor, apply these commits, and you have the
+Project Accessibility WCAG matrix, the remediation work queue and the WCAG
+verification panel wired to a Remedy server.
 
 ---
 
@@ -15,7 +16,7 @@ the Project Accessibility WCAG matrix wired to a Remedy server.
 git clone https://github.com/LibreTexts/conductor.git
 cd conductor
 git checkout -b feat/remedy-a11y-wiring
-git am /path/to/conductor-remedy-patch/patches/*.patch
+git am -3 /path/to/conductor-remedy-patch/patches/*.patch
 ```
 
 That is the whole procedure. The patches were generated against — and verified
@@ -27,14 +28,24 @@ to apply cleanly onto — upstream `LibreTexts/conductor` at:
 | Release | `2.144.0` |
 | Branch | `master` |
 
-If upstream has moved on and a hunk no longer applies, `git am` stops and tells
-you which file. Resolve, `git add`, `git am --continue`. Only two files are
-likely to drift: `server/api.js` (route table) and
-`client/src/components/projects/ProjectAccessibility.jsx`.
+Also verified against upstream `master` at `b0401094` (release `2.151.0`,
+2026-09-02): with `-3`, eleven patches apply untouched and patch 0001 stops on
+one trivial conflict in `server/package.json` — upstream changed the adjacent
+`"dev"` script line. Keep upstream's `"dev"` line, keep the added `"test"`
+line, `git add`, `git am --continue`, and the remaining eleven go through.
+
+If upstream has moved further and a hunk no longer applies, `git am` stops and
+tells you which file. Resolve, `git add`, `git am --continue`. The files most
+likely to drift: `server/api.js` (route table), `server/package.json`
+(scripts) and `client/src/components/projects/ProjectAccessibility.jsx`.
 
 ---
 
-## The three commits
+## The twelve commits
+
+Three layers. Each layer is usable without the ones after it.
+
+**Matrix (0001–0003)** — the original delivery.
 
 | # | Commit | What it does |
 |---|---|---|
@@ -42,27 +53,66 @@ likely to drift: `server/api.js` (route table) and
 | 2 | `feat(a11y): add Remedy scan/preview/apply endpoints and bulk section updates` | The server half. Four new routes plus bulk section item updates. |
 | 3 | `feat(a11y): add WCAG matrix, scoring, and Remedy review UI to Project Accessibility` | The client half. The matrix itself, the scoring module, and the preview/apply workflow. |
 
+**Work queue (0004–0007)** — scan findings become persistent work items.
+
+| # | Commit | What it does |
+|---|---|---|
+| 4 | `feat: connect remediation tasks to reviewed fixes and recovery` | `RemediationWorkItem` model, `GET/POST/PATCH …/accessibility/workqueue`, per-page actions (`scan`, `rendered-scan`, `apply`, `restore`) proxied to the bridge, and the queue + page-action UI under the matrix. |
+| 5 | `docs: document remediation release integration and validation limits` | `docs/remediation-integration.md`. |
+| 6 | `Refresh remediation matrix and support reviewed complex-image descriptions` | Matrix refreshes only after the scan persisted; evidence attaches to the selected task; reviewed long descriptions for complex images. |
+| 7 | `Document book remediation acceptance and static scanner limitations` | Docs: what a static scan cannot see. |
+
+**WCAG verification (0008–0010)** — human evidence, separate from the automated score.
+
+| # | Commit | What it does |
+|---|---|---|
+| 8 | `feat: require reviewer evidence for WCAG conformance` | `ConformanceRecord` (append-only), the 50-criterion checklist (`conformanceCriteria.json`), `GET …/workqueue/conformance`, `POST …/conformance/{scope,review,signoff}`, and the `ConformanceReview` panel. Reviewer identity and time are set server-side. |
+| 9 | `fix: invalidate failed scans and serve authenticated report downloads` | A failed scan cannot count as evidence; `GET …/conformance/report` is authenticated. |
+| 10 | `feat: separate remediation handoff acceptance from WCAG verification` | "Delivery accepted" is a distinct state from "criterion verified"; one cannot imply the other. |
+
+**Deployment fixes (0011–0012)**
+
+| # | Commit | What it does |
+|---|---|---|
+| 11 | `fix: honor configured Conductor browser origins` | CORS seeds its allow-list from `PRODUCTIONURLS` even when `NODE_ENV` is unset. Without this, browser-driven scans from a deployed Commons origin are rejected. |
+| 12 | `test(a11y): run RemediationPageActions under vitest` | The React test used `node:test`, which vitest cannot bundle; `npm test` in `client/` now passes. |
+
 Applying only commits 1 and 2 gives you a working API with no UI, which is a
-reasonable way to test the server integration on its own.
+reasonable way to test the server integration on its own. Stopping after 3
+gives you the matrix as originally shipped; after 7, the work queue; after 10,
+verification.
 
 ### Files touched
 
 ```
-client/src/components/projects/ProjectAccessibility.jsx   +1429   the matrix UI
+client/src/components/projects/ProjectAccessibility.jsx    +1433   the matrix UI
+client/src/components/projects/RemediationWorkQueue.tsx     +87   work queue panel (new)
+client/src/components/projects/RemediationPageActions.tsx  +110   per-page scan/apply/restore (new)
+client/src/components/projects/ConformanceReview.tsx        +90   WCAG verification panel (new)
 client/src/components/projects/accessibilityScore.ts       +155   scoring (new)
-client/src/components/projects/accessibilityScore.test.ts  +162   tests (new)
 client/src/components/projects/Projects.css                +383   matrix styles
 client/src/types/a11y.ts                                    +82   review shape (new)
-server/api/projects.js                                     +460   scan/preview/apply
+client/src/remediation-queue-entry.tsx                      +26   queue mount point (new)
+client/src/components/projects/*.test.ts                   +188   tests
+server/api/projects.js                                     +463   scan/preview/apply
+server/api/remediationqueue.ts                              +83   work-item routes (new)
+server/api/remediationactions.ts                            +74   page actions → bridge (new)
+server/api/conformance.ts                                   +53   verification routes (new)
 server/util/a11yreviewutils.ts                             +106   schema + TOC merge
-server/util/a11yreviewutils.test.ts                        +130   tests (new)
-server/api.js                                               +48   route registration
+server/util/remediationqueue.ts                             +42   RemediationWorkItem model (new)
+server/util/conformance.ts                                  +60   ConformanceRecord model (new)
+server/util/conformanceCriteria.json                       +452   WCAG 2.1 A/AA checklist (new)
+server/util/remediationHandoff.ts                           +40   handoff acceptance rules (new)
+server/util/*.test.ts                                      +423   tests
+server/api.js                                               +56   route registration + CORS
 server/models/project.ts                                     +5   stored remedy fields
 server/package.json                                          +1   server `npm test`
+docs/remediation-integration.md                             +77   (new)
+docs/accessibility-verification.md                          +19   (new)
 ```
 
-Roughly 2,900 lines. No dependencies are added — the Remedy client is plain
-`fetch` against the server's HTTP API.
+Roughly 4,400 lines across 31 files. No dependencies are added — the Remedy
+client is plain `fetch` against the server's HTTP API.
 
 ---
 
@@ -79,6 +129,16 @@ All under the existing authenticated project API:
 | POST | `/project/accessibility/remedy/preview` | Ask Remedy for a proposed fix. Returns an HTML diff and a `previewToken`. |
 | POST | `/project/accessibility/remedy/apply` | Apply a previously previewed fix. Requires the `previewToken`. |
 | PUT | `/project/accessibility/review/section/items` | Bulk-update checkbox matrix items for a section. |
+| GET / POST | `/project/:projectID/accessibility/workqueue` | List / create work items (page, criterion, finding evidence, owner, status). |
+| PATCH | `/project/:projectID/accessibility/workqueue/:itemID` | Change status, owner, note; history is appended, not rewritten. |
+| POST | `/project/:projectID/accessibility/workqueue/page/:sectionID/:action` | `scan`, `rendered-scan`, `apply`, `restore` — proxied to the Remedy bridge; evidence attaches to an `itemID` if given. |
+| GET | `/project/:projectID/accessibility/workqueue/conformance` | The scoped WCAG verification report. |
+| GET | `/project/:projectID/accessibility/workqueue/conformance/report` | Authenticated export of that report. |
+| POST | `/project/:projectID/accessibility/workqueue/conformance/:action` | `scope`, `review`, `signoff`. Reviewer identity and timestamp are server-set; records are append-only. |
+
+The work-queue and conformance routes reuse the project's edit permission
+check. Nothing in them writes to CXone directly — every write goes through the
+bridge, which enforces its own sandbox guard.
 
 **Apply is only reachable after a preview.** The client sends the preview hash
 back and the server rejects a stale one, so a page that changed between preview
@@ -150,9 +210,12 @@ accessibility matrix needs all three services.
 ## Tests
 
 ```bash
-cd server && npm test      # tsx --test, covers a11yreviewutils
-cd client && npm test      # vitest, covers accessibilityScore
+cd server && npm test      # tsx --test — 24 tests: a11yreviewutils, remediation queue/actions, conformance, handoff, CORS
+cd client && npm test      # vitest — 17 tests: accessibilityScore, RemediationPageActions
 ```
+
+Both suites, `tsc --noEmit` and `vite build` in `client/` were run on the
+patched tree at base `1c1a5ec1` before this set was published.
 
 The scoring tests are worth reading before changing anything: the denominator
 counts only pass/fail criteria. Manual-review and not-tested criteria are
@@ -167,7 +230,12 @@ The branch these came from lives in a private development fork alongside
 unrelated deployment work. Exporting the three commits keeps the delivery to
 exactly the accessibility matrix and nothing else.
 
-The patches are byte-identical to that branch, with one deliberate change: two
-`node_modules` symlinks pointing at an absolute local path were committed by
-accident and have been stripped. They resolved on one machine and would have
-broken every other checkout.
+Patches 0001–0003 are byte-identical to that branch, with one deliberate
+change: two `node_modules` symlinks pointing at an absolute local path were
+committed by accident and have been stripped. They resolved on one machine and
+would have broken every other checkout.
+
+Patches 0004–0010 are cherry-picks of the fork's later remediation commits onto
+that base (`-x` trailers name the originals). 0011 drops the fork's
+`docker-compose.yml` hunk, which belonged to one deployment, and the test that
+read it. 0012 is new to this set.

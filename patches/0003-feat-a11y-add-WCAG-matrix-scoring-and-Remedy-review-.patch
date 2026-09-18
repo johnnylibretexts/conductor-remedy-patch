@@ -1,7 +1,7 @@
 From 4bd9c2239c6467675c1a20497cca272d08f4f1b2 Mon Sep 17 00:00:00 2001
 From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
 Date: Sat, 15 Aug 2026 00:37:09 -0700
-Subject: [PATCH 3/3] feat(a11y): add WCAG matrix, scoring, and Remedy review
+Subject: [PATCH 03/12] feat(a11y): add WCAG matrix, scoring, and Remedy review
  UI to Project Accessibility
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
