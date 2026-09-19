@@ -1,7 +1,7 @@
 From 44c0009f26c7d4f8dc57db1eb91041c7170af92d Mon Sep 17 00:00:00 2001
 From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
 Date: Sun, 13 Sep 2026 21:34:42 -0700
-Subject: [PATCH 08/12] feat: require reviewer evidence for WCAG conformance
+Subject: [PATCH 08/14] feat: require reviewer evidence for WCAG conformance
 
 (cherry picked from commit c02ed17db66114327c1e985024c55a5a72b84974)
 ---

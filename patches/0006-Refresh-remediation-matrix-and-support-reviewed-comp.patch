@@ -1,7 +1,7 @@
 From 71faa112a66f620048bd8fef5c5148b1282da403 Mon Sep 17 00:00:00 2001
 From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
 Date: Sun, 13 Sep 2026 20:07:06 -0700
-Subject: [PATCH 06/12] Refresh remediation matrix and support reviewed
+Subject: [PATCH 06/14] Refresh remediation matrix and support reviewed
  complex-image descriptions
 
 (cherry picked from commit 473904889b40a410b2622b3bcf5dec93b7f98ce8)

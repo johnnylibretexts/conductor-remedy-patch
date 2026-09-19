@@ -1,7 +1,7 @@
 From 41413494ca5840aa8d6099e9490cbc6253b868af Mon Sep 17 00:00:00 2001
 From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
 Date: Fri, 18 Sep 2026 07:16:25 -0700
-Subject: [PATCH 11/12] fix: honor configured Conductor browser origins
+Subject: [PATCH 11/14] fix: honor configured Conductor browser origins
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

@@ -1,7 +1,7 @@
 From cb450f21f5615baacce1be92fb53e76786a34932 Mon Sep 17 00:00:00 2001
 From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
 Date: Fri, 18 Sep 2026 07:18:07 -0700
-Subject: [PATCH 12/12] test(a11y): run RemediationPageActions under vitest
+Subject: [PATCH 12/14] test(a11y): run RemediationPageActions under vitest
 
 The test imported node:test and built its own JSDOM, so `npm test` in
 client/ (vitest) failed to bundle it. Use vitest's jsdom environment and

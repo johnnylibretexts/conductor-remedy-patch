@@ -1,7 +1,7 @@
 From be5d0b3ad154047b36831210b7cae78c728e7ec8 Mon Sep 17 00:00:00 2001
 From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
 Date: Sun, 13 Sep 2026 21:56:46 -0700
-Subject: [PATCH 09/12] fix: invalidate failed scans and serve authenticated
+Subject: [PATCH 09/14] fix: invalidate failed scans and serve authenticated
  report downloads
 
 (cherry picked from commit c3f6303ca6d7523512a4e686cdf8407f8b7415ff)

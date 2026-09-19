@@ -1,0 +1,170 @@
+From 572ad13b6316e8eb8a09defc2cb3079ef497b898 Mon Sep 17 00:00:00 2001
+From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 15:15:47 -0700
+Subject: [PATCH 13/14] fix(a11y): require a reviewed preview before apply and report
+ empty writes
+
+Two gaps found while documenting the remediation workflow:
+
+- The matrix "Fix issues with Remedy" modal applied straight from a
+  preview, while the work-queue path required an explicit
+  acknowledgement. Apply now needs the same tick in both places.
+- The work queue reported "Apply completed" even when the bridge wrote
+  nothing (the preview held no content change). It now says no changes
+  were written, using the bridge's own `applied` flag.
+
+Tests: client 19/19 (two new cases cover both apply outcomes),
+server 24/24, tsc clean, vite build clean.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../projects/ProjectAccessibility.jsx         | 17 ++++++++++++
+ .../projects/RemediationPageActions.test.ts   | 27 +++++++++++++++++++
+ .../projects/RemediationPageActions.tsx       |  6 ++++-
+ 3 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/client/src/components/projects/ProjectAccessibility.jsx b/client/src/components/projects/ProjectAccessibility.jsx
+index 6e6652d6..17a640ba 100644
+--- a/client/src/components/projects/ProjectAccessibility.jsx
++++ b/client/src/components/projects/ProjectAccessibility.jsx
+@@ -560,6 +560,7 @@ const ProjectAccessibility = (props) => {
+     const previewPanelRef = useRef(null);
+     const [applyLoading, setApplyLoading] = useState(false);
+     const [applyResult, setApplyResult] = useState(null);
++    const [fixReviewed, setFixReviewed] = useState(false);
+     const reviewSectionsRef = React.useRef([]);
+     const legacyCriteriaUpdatesRef = React.useRef({});
+     const lastPersistedA11yProgressRef = React.useRef(0);
+@@ -1122,6 +1123,7 @@ const ProjectAccessibility = (props) => {
+             setFixActionsBlocked(false);
+             setPreviewData(null);
+             setApplyResult(null);
++        setFixReviewed(false);
+         }
+     };
+ 
+@@ -1221,6 +1223,7 @@ const ProjectAccessibility = (props) => {
+         setFixActionsBlocked(Boolean(blocked));
+         setPreviewData(null);
+         setApplyResult(null);
++        setFixReviewed(false);
+         setShowFixModal(true);
+     };
+ 
+@@ -1231,12 +1234,14 @@ const ProjectAccessibility = (props) => {
+         }
+         setPreviewData(null);
+         setApplyResult(null);
++        setFixReviewed(false);
+     };
+ 
+     const changePipelineTier = (tier) => {
+         setPipelineTier(Number(tier));
+         setPreviewData(null);
+         setApplyResult(null);
++        setFixReviewed(false);
+     };
+ 
+     const toggleSelectedFinding = (findingID, checked) => {
+@@ -1248,6 +1253,7 @@ const ProjectAccessibility = (props) => {
+         });
+         setPreviewData(null);
+         setApplyResult(null);
++        setFixReviewed(false);
+     };
+ 
+     const refreshSectionAfterApply = async (section, findingsForRefresh) => {
+@@ -1286,6 +1292,7 @@ const ProjectAccessibility = (props) => {
+         setPreviewLoading(true);
+         setPreviewData(null);
+         setApplyResult(null);
++        setFixReviewed(false);
+         try {
+             await ensureRemedyServerReady();
+             const findingIDs = selectedFindingIDs.length > 0
+@@ -1316,6 +1323,7 @@ const ProjectAccessibility = (props) => {
+         }
+         setApplyLoading(true);
+         setApplyResult(null);
++        setFixReviewed(false);
+         try {
+             await ensureRemedyServerReady();
+             const findingIDs = selectedFindingIDs.length > 0
+@@ -1405,6 +1413,7 @@ const ProjectAccessibility = (props) => {
+     const canApplyRemedyFix = canRunRemedyFixActions
+         && previewData
+         && !previewData.noise_only_change
++        && fixReviewed
+         && !applyResult
+         && (isPipelineFixMode || selectedFixableFindings.length > 0);
+     const pipelineTierOptions = [
+@@ -2065,6 +2074,14 @@ const ProjectAccessibility = (props) => {
+                                         selectedCount={selectedFindingIDs.length}
+                                         panelRef={previewPanelRef}
+                                     />
++                                    {previewData && !applyResult && (
++                                        <Form.Checkbox
++                                            className='mt-1p'
++                                            label='I reviewed this preview and want to apply these changes.'
++                                            checked={fixReviewed}
++                                            onChange={(_e, { checked }) => setFixReviewed(Boolean(checked))}
++                                        />
++                                    )}
+                                     <ApplyResultPanel applyResult={applyResult} />
+                                 </>
+                             )}
+diff --git a/client/src/components/projects/RemediationPageActions.test.ts b/client/src/components/projects/RemediationPageActions.test.ts
+index 3fa9dc7e..77cf064a 100644
+--- a/client/src/components/projects/RemediationPageActions.test.ts
++++ b/client/src/components/projects/RemediationPageActions.test.ts
+@@ -24,3 +24,30 @@ for (const scenario of [{item:false,error:false},{item:true,error:false},{item:f
+     } finally {await act(async()=>root.unmount());container.remove();}
+   });
+ }
++
++for (const applied of [false, true]) {
++  test(`apply reports whether the bridge wrote anything: applied=${applied}`, async () => {
++    const container = document.createElement('div');
++    document.body.appendChild(container);
++    const root = createRoot(container);
++    try {
++      await act(async () => root.render(React.createElement(RemediationPageActions, {
++        base: '/test', section: { id: 'page', title: 'Page' }, item: { _id: 'task', title: 'Image' },
++        request: async (url: string) => {
++          const action = url.split('/').pop();
++          if (action === 'scan') return { findings: [{ id: 'f1', message: 'Duplicate id', fixable: true }], scanned_at: '2026-09-19', page_url: 'https://dev.libretexts.org/Sandboxes/johnnyphung/p' };
++          if (action === 'preview') return { before_html: '<p id="a"></p>', after_html: '<p id="a-2"></p>', diff: '-a\n+a-2', preview_token: 't', preview_hash: 'h' };
++          return { applied, scan: { findings: [] } };
++        },
++        refreshed: async () => {}, onScanSaved: () => {}, close: () => {},
++      })));
++      const click = async (label: string) => act(async () => Array.from(container.querySelectorAll('button')).find(b => b.textContent === label)!.click());
++      await click('Rescan page');
++      await click('Preview selected fix');
++      await act(async () => Array.from(container.querySelectorAll<HTMLInputElement>('input[type=checkbox]')).at(-1)!.click());
++      await click('Apply reviewed fix and rescan');
++      expect(container.textContent?.includes('No changes were written')).toBe(!applied);
++      expect(container.textContent?.includes('Apply completed.')).toBe(applied);
++    } finally { await act(async () => root.unmount()); container.remove(); }
++  });
++}
+diff --git a/client/src/components/projects/RemediationPageActions.tsx b/client/src/components/projects/RemediationPageActions.tsx
+index 447046bc..df9850bb 100644
+--- a/client/src/components/projects/RemediationPageActions.tsx
++++ b/client/src/components/projects/RemediationPageActions.tsx
+@@ -52,7 +52,11 @@ export default function RemediationPageActions({ base, section, item, request, r
+         const result = await call(action, { findingIDs: selected, fixMode: mode === 'deterministic' ? mode : 'pipeline', previewHash: preview.preview_hash, previewToken: preview.preview_token });
+         invalidate(); if (result.scan) { selectFindings(result.scan); if (!result.scanError) onScanSaved?.(); }
+         if (result.snapshot_path) setLastSnapshot(result.snapshot_path.split('/').pop());
+-        setMessage(`${action === 'apply' ? 'Apply' : 'Restore'} completed. ${result.scanError || result.evidenceError || (item ? 'Rescan complete; evidence attached. Final verification remains with the reviewer.' : 'Rescan complete. Matrix updated. Final verification remains with the reviewer.')}`);
++        const wroteNothing = action === 'apply' && result.applied === false;
++        const outcome = wroteNothing
++          ? 'No changes were written: the preview contained no content change.'
++          : `${action === 'apply' ? 'Apply' : 'Restore'} completed.`;
++        setMessage(`${outcome} ${result.scanError || result.evidenceError || (item ? 'Rescan complete; evidence attached. Final verification remains with the reviewer.' : 'Rescan complete. Matrix updated. Final verification remains with the reviewer.')}`);
+       }
+       await refreshed();
+     } catch (e: any) { setError(e.message); if (action === 'apply' || action === 'restore') invalidate(); }
+-- 
+2.50.1 (Apple Git-155)
+

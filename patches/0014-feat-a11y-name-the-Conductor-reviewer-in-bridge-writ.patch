@@ -1,0 +1,50 @@
+From 3fff8a161a2651e015d659d1808525549adf6db9 Mon Sep 17 00:00:00 2001
+From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 15:17:32 -0700
+Subject: [PATCH 14/14] feat(a11y): name the Conductor reviewer in bridge write
+ requests
+
+Page actions forwarded no user identity, so the bridge audit log recorded
+only the server account that runs it. Apply and restore now send
+`requested_by` (the authenticated Conductor uuid), which the bridge
+records beside its own operator field.
+
+Tests: server 24/24, including a new assertion that the forwarded body
+names the requesting user.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ server/api/remediationactions.ts       | 4 +++-
+ server/util/remediationactions.test.ts | 1 +
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/server/api/remediationactions.ts b/server/api/remediationactions.ts
+index 9f1f5126..d9a839f2 100644
+--- a/server/api/remediationactions.ts
++++ b/server/api/remediationactions.ts
+@@ -19,7 +19,9 @@ export function registerRemediationActions(router: any, { base, access, Project,
+       // Browser-provided URLs, IDs, snapshots paths and scan evidence are never forwarded.
+       const body = { ...page, finding_ids: req.body.findingIDs, fix_mode: req.body.fixMode,
+         describe_image: req.body.imageSource, review_images: req.body.reviewImages === true, tier: req.body.tier, preview_hash: req.body.previewHash, preview_token: req.body.previewToken,
+-        alt_edits: req.body.altEdits, snapshot_timestamp: req.body.snapshotTimestamp };
++        alt_edits: req.body.altEdits, snapshot_timestamp: req.body.snapshotTimestamp,
++        // The bridge audit log otherwise records only the server account.
++        requested_by: req.user.decoded.uuid };
+       const scan = () => bridge('scan', { ...page, rendered: action === 'rendered-scan', wcag_review: section.wcagReview, doj_exceptions: section.dojExceptions || [] });
+       const persistScan = async (result: any) => {
+         await Project.updateOne({ projectID: req.params.projectID, 'a11yReview._id': section._id }, {
+diff --git a/server/util/remediationactions.test.ts b/server/util/remediationactions.test.ts
+index 482c7212..157e81d8 100644
+--- a/server/util/remediationactions.test.ts
++++ b/server/util/remediationactions.test.ts
+@@ -35,6 +35,7 @@ test('apply rescans, saves server evidence, ignores forged page data, and leaves
+   assert.deepEqual(calls.map(c => c.action), ['apply-fix', 'scan']);
+   assert.equal(calls[0].body.page_url, 'https://dev.libretexts.org/Sandboxes/johnnyphung/Test');
+   assert.equal(calls[0].body.page_id, undefined);
++  assert.equal(calls[0].body.requested_by, 'alice');
+   assert.equal(evidence[0].criterion.status, 'pass'); assert.equal(evidence[0].actor, 'alice');
+   assert.equal(row.status, 'in_progress');
+ }));
+-- 
+2.50.1 (Apple Git-155)
+

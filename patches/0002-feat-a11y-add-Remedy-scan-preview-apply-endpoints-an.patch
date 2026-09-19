@@ -1,7 +1,7 @@
 From 4c7d21656e58ac9eeb31a886e365ed24be5ebd9a Mon Sep 17 00:00:00 2001
 From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
 Date: Sat, 15 Aug 2026 00:37:09 -0700
-Subject: [PATCH 02/12] feat(a11y): add Remedy scan/preview/apply endpoints and
+Subject: [PATCH 02/14] feat(a11y): add Remedy scan/preview/apply endpoints and
  bulk section updates
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

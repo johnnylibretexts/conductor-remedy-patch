@@ -1,7 +1,7 @@
 From 63d9fad953ce4c26b433b98fee261c6ccba764e0 Mon Sep 17 00:00:00 2001
 From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
 Date: Sun, 13 Sep 2026 23:03:09 -0700
-Subject: [PATCH 10/12] feat: separate remediation handoff acceptance from WCAG
+Subject: [PATCH 10/14] feat: separate remediation handoff acceptance from WCAG
  verification
 
 (cherry picked from commit 01aad7ff0d8c2e8816c0233a5eb339f1dddd133d)

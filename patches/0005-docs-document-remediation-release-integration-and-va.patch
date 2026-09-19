@@ -1,7 +1,7 @@
 From aad8a192a45a00bb1eb3e47dda535707235f8143 Mon Sep 17 00:00:00 2001
 From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
 Date: Sun, 13 Sep 2026 10:55:28 -0700
-Subject: [PATCH 05/12] docs: document remediation release integration and
+Subject: [PATCH 05/14] docs: document remediation release integration and
  validation limits
 
 (cherry picked from commit 4bfeade5b72c0040294039e3393240167d2a0fa3)

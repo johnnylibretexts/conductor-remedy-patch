@@ -1,7 +1,7 @@
 From 2e6dac30a3841fa2ccfe1e4e4f52742514205c27 Mon Sep 17 00:00:00 2001
 From: johnnylibretexts <264531926+johnnylibretexts@users.noreply.github.com>
 Date: Sun, 13 Sep 2026 20:35:46 -0700
-Subject: [PATCH 07/12] Document book remediation acceptance and static scanner
+Subject: [PATCH 07/14] Document book remediation acceptance and static scanner
  limitations
 
 (cherry picked from commit 9690cd8ef88831392c90dfe71c94a307a751bcca)
